@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sunset Squadron: Crown Chase</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Sunset Squadron" />
+  <meta name="theme-color" content="#2b1e4a" />
+  <meta name="format-detection" content="telephone=no" />
+  <link rel="icon" type="image/png" href="/favicon.ico" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+
+  <!-- ===================== LOBBY ===================== -->
+  <div id="lobby" class="screen">
+    <div class="lobby-bg"></div>
+    <div class="lobby-card glass">
+      <header class="lobby-header">
+        <h1><span class="title-sun">SUNSET SQUADRON</span><span class="title-sub">CROWN CHASE</span></h1>
+        <p class="story">Renji, Resa and Kaya have raced their jets over the floating isles every summer.
+          This year the Golden Crown is up for grabs — scan, pick a pilot, and chase the sunset.</p>
+      </header>
+
+      <div class="lobby-grid">
+        <section class="lobby-col qr-col">
+          <h2>Join on iPad</h2>
+          <div class="qr-box"><img id="qr-img" alt="Scan to join" /></div>
+          <div id="join-url" class="join-url">loading…</div>
+          <div class="hint">Scan with the iPad camera, then tap <em>Add to Home Screen</em> for fullscreen.</div>
+        </section>
+
+        <section class="lobby-col pilot-col">
+          <div id="pilot-setup">
+            <h2>Your pilot</h2>
+            <div id="callsign-picker" class="picker"></div>
+            <h2>Paint</h2>
+            <div id="color-picker" class="picker colors"></div>
+            <button id="btn-launch" class="big-btn orange">LAUNCH JET</button>
+            <div id="join-error" class="error"></div>
+          </div>
+
+          <div id="roster-panel" class="hidden">
+            <h2>Squadron <span id="roster-count"></span></h2>
+            <ul id="roster"></ul>
+            <div class="settings">
+              <label>Mode
+                <div class="toggle" id="mode-toggle">
+                  <button data-mode="crown" class="active">Crown Tag</button>
+                  <button data-mode="blitz">Arch &amp; Balloon Blitz</button>
+                </div>
+              </label>
+              <label>Time of day
+                <div class="toggle" id="preset-toggle">
+                  <button data-preset="sunset" class="active">Golden Sunset</button>
+                  <button data-preset="noon">High Noon Tropics</button>
+                  <button data-preset="twilight">Neon Twilight</button>
+                </div>
+              </label>
+              <label>AI wingmen
+                <div class="toggle" id="bots-toggle">
+                  <button data-bots="0">0</button>
+                  <button data-bots="2" class="active">2</button>
+                  <button data-bots="3">3</button>
+                  <button data-bots="4">4</button>
+                </div>
+              </label>
+            </div>
+            <button id="btn-start" class="big-btn green hidden">START ROUND</button>
+            <div id="host-wait" class="hint">Waiting for the host to start the round…</div>
+            <div class="hint keys">Desktop: WASD / arrows steer · Shift boost (tap = barrel roll) · Space firework</div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== HUD ===================== -->
+  <div id="hud" class="screen hidden">
+    <div class="hud-top">
+      <div class="glass hud-pill" id="hud-mode">CROWN TAG</div>
+      <div class="glass hud-pill timer" id="hud-timer">3:00</div>
+      <div class="glass hud-pill" id="hud-crown">👑 —</div>
+    </div>
+    <div class="hud-left glass">
+      <div class="hud-name" id="hud-name">—</div>
+      <div class="hud-score"><span id="hud-score">0</span> pts</div>
+      <div class="bar"><div class="bar-fill stamina" id="hud-stamina"></div></div>
+      <div class="bar"><div class="bar-fill cooldown" id="hud-cooldown"></div></div>
+      <div class="hud-speed"><span id="hud-speed">48</span> kn</div>
+    </div>
+    <div class="hud-right glass" id="hud-board"></div>
+    <div id="hud-feed"></div>
+    <div id="hud-banner" class="hidden"></div>
+    <div id="crown-arrow" class="hidden">▲</div>
+  </div>
+
+  <!-- ===================== TOUCH CONTROLS ===================== -->
+  <div id="touch-layer" class="ui-layer hidden">
+    <div id="joy-base"><div id="joy-knob"></div></div>
+    <div class="btn-cluster">
+      <button id="btn-boost" class="touch-btn cyan"><span>BOOST</span><small>tap = ROLL</small></button>
+      <button id="btn-fire" class="touch-btn orange"><span>FIREWORK</span><small>hold = auto</small></button>
+    </div>
+  </div>
+
+  <!-- ===================== ROUND END ===================== -->
+  <div id="results" class="screen hidden">
+    <div class="glass results-card">
+      <h1 id="results-title">ROUND OVER</h1>
+      <ol id="results-list"></ol>
+      <div class="hint">Back to the lobby in a moment…</div>
+    </div>
+  </div>
+
+  <div id="rotate-hint" class="hidden">Rotate your iPad to landscape ↻</div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

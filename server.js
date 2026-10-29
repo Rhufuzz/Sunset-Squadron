@@ -1,0 +1,1035 @@
+'use strict';
+/*
+ * Sunset Squadron: Crown Chase - authoritative game server.
+ *
+ * - Express serves the static frontend from ./public
+ * - /api/host-info returns the join URL, a QR code data URL and the current world seed
+ * - Socket.io runs the lobby and a 20Hz authoritative game loop:
+ *     rockets, homing, hits, crown transfers, ribbon-contrail steals,
+ *     balloons, ring gates, super-charge, scores, round timer and AI wingman bots.
+ * - Human players fly their own jets client-side (60fps prediction) and report their
+ *   transform 20 times per second; the server sanity-clamps it and runs all game rules.
+ */
+
+const os = require('os');
+const http = require('http');
+const path = require('path');
+const express = require('express');
+const { Server } = require('socket.io');
+const QRCode = require('qrcode');
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
+const TICK_MS = 50;                  // 20Hz
+const ROUND_SECONDS = parseInt(process.env.ROUND_SECONDS, 10) || 180;  // 3-minute rounds (override only for testing)
+const ROUND_END_SHOW_MS = 9000;      // scoreboard duration before returning to lobby
+const MAX_PLAYERS = 8;
+const WORLD_RADIUS = 950;
+const CEILING = 260;
+const WATER_LEVEL = 0;
+
+const SPEED_BASE = 48;
+const SPEED_BOOST = 85;
+const SPEED_SUPER = 100;
+const ROCKET_SPEED = 130;
+const ROCKET_LIFE = 3.2;
+const ROCKET_COOLDOWN = 1.2;
+const ROCKET_COOLDOWN_SUPER = 0.6;
+const HOMING_CONE = (28 * Math.PI) / 180;
+const HOMING_RANGE = 220;
+const HOMING_TURN = 2.4;
+const BARREL_ROLL_TIME = 0.45;
+const TUMBLE_TIME = 0.6;
+const CROWN_BURST_TIME = 3.0;
+const SUPER_TIME = 8.0;
+const RIBBON_POINTS = 44;            // ~2.2 seconds of ribbon at 20Hz
+const RIBBON_MIN_AGE = 0.5;          // seconds before a ribbon segment can be stolen through
+const BALLOON_RESPAWN_S = 18;
+
+const CALLSIGNS = ['Renji', 'Resa', 'Kaya', 'Viper', 'Falcon', 'Nova', 'Blaze', 'Maverick', 'Comet', 'Echo', 'Bolt'];
+const BOT_NAMES = ['Wingman Ace', 'Wingman Duke', 'Wingman Pip', 'Wingman Zed'];
+const PRESETS = ['sunset', 'noon', 'twilight'];
+const MODES = ['crown', 'blitz'];
+
+// ---------------------------------------------------------------------------
+// Shared deterministic world layout (identical code lives in public/js/world.js)
+// ---------------------------------------------------------------------------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function randomBalloonPos(rand, islands) {
+  for (let tries = 0; tries < 20; tries++) {
+    const ang = rand() * Math.PI * 2;
+    const dist = 60 + rand() * 560;
+    const x = Math.cos(ang) * dist;
+    const z = Math.sin(ang) * dist;
+    const y = 30 + rand() * 110;
+    let ok = true;
+    for (const isl of islands) {
+      if (Math.hypot(x - isl.x, z - isl.z) < isl.rx + 12 && y < isl.cy + isl.ry + 20 && y > isl.cy - isl.ry - 10) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return { x, y, z };
+  }
+  return { x: 0, y: 160, z: 0 };
+}
+
+function generateLayout(seed) {
+  const rand = mulberry32(seed);
+  const islands = [];
+  // Central caldera island: collision ellipsoid centred at sea level.
+  islands.push({ kind: 'central', x: 0, y: 0, z: 0, r: 110, cx: 0, cy: 2, cz: 0, rx: 108, ry: 46 });
+  const outer = 6;
+  for (let i = 0; i < outer; i++) {
+    const ang = (i / outer) * Math.PI * 2 + (rand() - 0.5) * 0.5;
+    const dist = 300 + rand() * 140;
+    const r = 42 + rand() * 34;
+    const y = 40 + rand() * 70;
+    islands.push({
+      kind: 'floating',
+      x: Math.cos(ang) * dist,
+      y,
+      z: Math.sin(ang) * dist,
+      r,
+      cx: Math.cos(ang) * dist,
+      cy: y - r * 0.3,
+      cz: Math.sin(ang) * dist,
+      rx: r * 1.02,
+      ry: r * 0.75,
+    });
+  }
+  const arches = [];
+  for (let i = 0; i < 12; i++) {
+    const ang = (i / 12) * Math.PI * 2 + (rand() - 0.5) * 0.3;
+    const dist = 170 + rand() * 330;
+    let x = Math.cos(ang) * dist;
+    let z = Math.sin(ang) * dist;
+    for (const isl of islands) {
+      const dx = x - isl.x;
+      const dz = z - isl.z;
+      const d = Math.hypot(dx, dz);
+      if (d < isl.rx + 34) {
+        const k = (isl.rx + 34) / Math.max(d, 1);
+        x = isl.x + dx * k;
+        z = isl.z + dz * k;
+      }
+    }
+    const y = 35 + rand() * 90;
+    const yaw = rand() * Math.PI * 2;
+    arches.push({ id: i, x, y, z, yaw, r: 14, gateR: 10, hue: i % 2 });
+  }
+  const balloons = [];
+  for (let i = 0; i < 40; i++) {
+    const p = randomBalloonPos(rand, islands);
+    balloons.push({ id: i, x: p.x, y: p.y, z: p.z, tint: Math.floor(rand() * 6) });
+  }
+  const clouds = [];
+  for (let i = 0; i < 36; i++) {
+    const ang = rand() * Math.PI * 2;
+    const dist = 100 + rand() * 900;
+    clouds.push({ x: Math.cos(ang) * dist, y: 150 + rand() * 120, z: Math.sin(ang) * dist, s: 10 + rand() * 18, puffs: 3 + Math.floor(rand() * 4) });
+  }
+  return { seed, islands, arches, balloons, clouds };
+}
+
+// ---------------------------------------------------------------------------
+// Small vector / orientation helpers (match THREE Euler order 'YXZ')
+// ---------------------------------------------------------------------------
+function quatFromYPR(yaw, pitch, roll) {
+  const c1 = Math.cos(pitch / 2), c2 = Math.cos(yaw / 2), c3 = Math.cos(roll / 2);
+  const s1 = Math.sin(pitch / 2), s2 = Math.sin(yaw / 2), s3 = Math.sin(roll / 2);
+  return {
+    x: s1 * c2 * c3 + c1 * s2 * s3,
+    y: c1 * s2 * c3 - s1 * c2 * s3,
+    z: c1 * c2 * s3 - s1 * s2 * c3,
+    w: c1 * c2 * c3 + s1 * s2 * s3,
+  };
+}
+function forwardFromYP(yaw, pitch) {
+  const cp = Math.cos(pitch);
+  return { x: -cp * Math.sin(yaw), y: Math.sin(pitch), z: -cp * Math.cos(yaw) };
+}
+function wrapAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function vlen(v) { return Math.hypot(v.x, v.y, v.z); }
+function vsub(a, b) { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+function vdot(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+function vnorm(v) { const l = vlen(v) || 1; return { x: v.x / l, y: v.y / l, z: v.z / l }; }
+function vscale(v, s) { return { x: v.x * s, y: v.y * s, z: v.z * s }; }
+function vadd(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+function r2(n) { return Math.round(n * 100) / 100; }
+function r3(n) { return Math.round(n * 1000) / 1000; }
+
+/** Returns an outward push normal if pos is inside an island ellipsoid, else null. */
+function islandCollision(pos, islands) {
+  for (const isl of islands) {
+    const dx = (pos.x - isl.cx) / isl.rx;
+    const dy = (pos.y - isl.cy) / isl.ry;
+    const dz = (pos.z - isl.cz) / isl.rx;
+    const q = dx * dx + dy * dy + dz * dz;
+    if (q < 1) {
+      const n = vnorm({ x: dx / isl.rx, y: dy / isl.ry, z: dz / isl.rx });
+      const push = (1 - Math.sqrt(q)) * Math.min(isl.rx, isl.ry) + 2;
+      return { n, push, island: isl };
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
+const state = {
+  phase: 'lobby',               // lobby | playing | ended
+  seed: (Math.random() * 0x7fffffff) >>> 0,
+  layout: null,
+  settings: { mode: 'crown', preset: 'sunset', bots: 2 },
+  hostId: null,
+  players: new Map(),           // id -> player (humans and bots)
+  joinOrder: [],
+  rockets: [],
+  rocketSeq: 1,
+  crown: { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] },
+  balloons: [],
+  roundEndsAt: 0,
+  endedAt: 0,
+  lastResults: null,
+};
+state.layout = generateLayout(state.seed);
+
+function now() { return Date.now() / 1000; }
+
+function makePlayer(id, name, color, isBot) {
+  return {
+    id, name, color, isBot,
+    pos: { x: 0, y: 80, z: 0 },
+    quat: { x: 0, y: 0, z: 0, w: 1 },
+    yaw: 0, pitch: 0, roll: 0,
+    speed: SPEED_BASE,
+    boost: false,
+    stamina: 1,
+    score: 0,
+    rollingUntil: 0,
+    tumbleUntil: 0,
+    invulnUntil: 0,
+    burstUntil: 0,
+    superUntil: 0,
+    lastFire: 0,
+    lastSeen: now(),
+    gateSide: {},
+    gateCooldown: {},
+    joy: { x: 0, y: 0 },
+    bot: null,
+  };
+}
+
+function humans() { return [...state.players.values()].filter((p) => !p.isBot); }
+function bots() { return [...state.players.values()].filter((p) => p.isBot); }
+
+function spawnPlayer(p, index, total) {
+  const ang = (index / Math.max(total, 1)) * Math.PI * 2;
+  const radius = 230;
+  p.pos = { x: Math.cos(ang) * radius, y: 70 + (index % 3) * 12, z: Math.sin(ang) * radius };
+  // Face the centre of the archipelago
+  const toCenter = vnorm({ x: -p.pos.x, y: 0, z: -p.pos.z });
+  p.yaw = Math.atan2(-toCenter.x, -toCenter.z);
+  p.pitch = 0;
+  p.roll = 0;
+  p.speed = SPEED_BASE;
+  p.quat = quatFromYPR(p.yaw, 0, 0);
+  p.score = 0;
+  p.rollingUntil = 0; p.tumbleUntil = 0; p.invulnUntil = 0; p.burstUntil = 0; p.superUntil = 0;
+  p.lastFire = 0;
+  p.gateSide = {};
+  p.gateCooldown = {};
+  p.stamina = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Express + Socket.io
+// ---------------------------------------------------------------------------
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*' },
+  transports: ['websocket', 'polling'],
+  pingInterval: 10000,
+  pingTimeout: 20000,
+});
+
+app.use(express.static(path.join(__dirname, 'public'), { etag: true, maxAge: 0 }));
+
+// ---------------------------------------------------------------------------
+// Procedural app icon (no asset files): a 180x180 sunset gradient with a gold crown disc,
+// encoded as PNG with zlib so iOS "Add to Home Screen" and browser tabs get an icon.
+// ---------------------------------------------------------------------------
+const zlib = require('zlib');
+function crc32(buf) {
+  let c, crc = 0xffffffff;
+  for (let n = 0; n < buf.length; n++) {
+    c = (crc ^ buf[n]) & 0xff;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crc = (crc >>> 8) ^ c;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+  const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+  return Buffer.concat([len, td, crc]);
+}
+function buildIconPng(size) {
+  const raw = Buffer.alloc((size * 4 + 1) * size);
+  const top = [43, 30, 74], mid = [232, 111, 82], bot = [255, 190, 118];
+  for (let y = 0; y < size; y++) {
+    raw[y * (size * 4 + 1)] = 0;
+    const k = y / (size - 1);
+    const a = k < 0.55 ? top : mid, b = k < 0.55 ? mid : bot, kk = k < 0.55 ? k / 0.55 : (k - 0.55) / 0.45;
+    for (let x = 0; x < size; x++) {
+      const o = y * (size * 4 + 1) + 1 + x * 4;
+      let r = a[0] + (b[0] - a[0]) * kk, g = a[1] + (b[1] - a[1]) * kk, bl = a[2] + (b[2] - a[2]) * kk;
+      const dx = x - size / 2, dy = y - size * 0.6;
+      const d = Math.hypot(dx, dy);
+      if (d < size * 0.22) { r = 255; g = 213; bl = 74; }
+      else if (d < size * 0.26) { r = r * 0.5 + 128; g = g * 0.5 + 100; bl = bl * 0.5 + 30; }
+      // crown spikes
+      const spike = Math.abs(((x / size) * 5) % 1 - 0.5) * 2;
+      if (y > size * 0.2 && y < size * 0.4 && dx * dx < (size * 0.3) ** 2 && (size * 0.4 - y) / (size * 0.2) < 1 - spike) { r = 255; g = 213; bl = 74; }
+      raw[o] = r | 0; raw[o + 1] = g | 0; raw[o + 2] = bl | 0; raw[o + 3] = 255;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+const ICON_PNG = buildIconPng(180);
+for (const route of ['/favicon.ico', '/apple-touch-icon.png', '/apple-touch-icon-precomposed.png', '/icon.png']) {
+  app.get(route, (req, res) => { res.type('png').set('Cache-Control', 'public, max-age=86400').send(ICON_PNG); });
+}
+app.get('/manifest.webmanifest', (req, res) => {
+  res.type('application/manifest+json').json({
+    name: 'Sunset Squadron: Crown Chase', short_name: 'Sunset Squadron', start_url: '/', display: 'fullscreen',
+    orientation: 'landscape', background_color: '#2b1e4a', theme_color: '#2b1e4a',
+    icons: [{ src: '/icon.png', sizes: '180x180', type: 'image/png' }],
+  });
+});
+
+function detectLanIPv4() {
+  const ifaces = os.networkInterfaces();
+  const candidates = [];
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name] || []) {
+      const isV4 = iface.family === 'IPv4' || iface.family === 4;
+      if (!isV4 || iface.internal) continue;
+      const a = iface.address;
+      let score = 0;
+      if (a.startsWith('192.168.')) score = 3;
+      else if (a.startsWith('10.')) score = 2;
+      else if (/^172\.(1[6-9]|2\d|3[01])\./.test(a)) score = 2;
+      else score = 1;
+      if (/^(docker|br-|veth|virbr|vmnet|tun|tap)/i.test(name)) score -= 2;
+      candidates.push({ a, score });
+    }
+  }
+  candidates.sort((x, y) => y.score - x.score);
+  return candidates.length ? candidates[0].a : '127.0.0.1';
+}
+
+function hostUrl() {
+  if (PUBLIC_URL) return PUBLIC_URL;
+  return `http://${detectLanIPv4()}:${PORT}`;
+}
+
+app.get('/api/host-info', async (req, res) => {
+  try {
+    let url = hostUrl();
+    // The lobby page may ask for a QR of the origin it was actually loaded from
+    // (e.g. a public VPS hostname while the server only auto-detected a private LAN IP).
+    const requested = typeof req.query.url === 'string' ? req.query.url.trim().replace(/\/+$/, '') : '';
+    if (requested && /^https?:\/\/[\w.\-:[\]]+$/.test(requested) && requested.length < 200) url = requested;
+    const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 320, color: { dark: '#1a1030', light: '#fff6e8' } });
+    res.json({ url, qrDataUrl, seed: state.seed, isPublicUrl: Boolean(PUBLIC_URL) });
+  } catch (err) {
+    res.status(500).json({ error: String(err && err.message ? err.message : err) });
+  }
+});
+
+app.get('/api/status', (req, res) => {
+  res.json({
+    phase: state.phase,
+    players: humans().length,
+    bots: bots().length,
+    settings: state.settings,
+    seed: state.seed,
+    timeRemaining: state.phase === 'playing' ? Math.max(0, (state.roundEndsAt - Date.now()) / 1000) : 0,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lobby
+// ---------------------------------------------------------------------------
+function lobbyPayload() {
+  return {
+    phase: state.phase,
+    hostId: state.hostId,
+    settings: state.settings,
+    seed: state.seed,
+    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, color: p.color, isBot: p.isBot, score: p.score })),
+    timeRemaining: state.phase === 'playing' ? Math.max(0, (state.roundEndsAt - Date.now()) / 1000) : 0,
+    lastResults: state.lastResults,
+  };
+}
+function broadcastLobby() { io.emit('lobby', lobbyPayload()); }
+
+function pickHost() {
+  const list = humans();
+  if (state.hostId && state.players.has(state.hostId)) return;
+  state.hostId = list.length ? list[0].id : null;
+}
+
+function roundStartPayload() {
+  return {
+    seed: state.seed,
+    mode: state.settings.mode,
+    preset: state.settings.preset,
+    endsAt: state.roundEndsAt,
+    serverNow: Date.now(),
+    balloons: state.balloons.map((b) => ({ id: b.id, x: r2(b.x), y: r2(b.y), z: r2(b.z), alive: b.alive, tint: b.tint })),
+    crown: { holderId: state.crown.holderId, pos: state.crown.pos },
+    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, color: p.color, isBot: p.isBot, pos: p.pos, yaw: p.yaw })),
+  };
+}
+
+function startRound() {
+  if (state.phase === 'playing') return;
+  // New world every round so the archipelago stays fresh
+  state.seed = (Math.random() * 0x7fffffff) >>> 0;
+  state.layout = generateLayout(state.seed);
+  // Remove previous bots, add new ones
+  for (const b of bots()) state.players.delete(b.id);
+  for (let i = 0; i < state.settings.bots; i++) {
+    const id = `bot-${i + 1}`;
+    const b = makePlayer(id, BOT_NAMES[i % BOT_NAMES.length], (i * 3 + 5) % 8, true);
+    b.bot = { targetId: null, fleeUntil: 0, retarget: 0, wander: 0, boostUntil: 0 };
+    state.players.set(id, b);
+  }
+  const all = [...state.players.values()];
+  all.forEach((p, i) => spawnPlayer(p, i, all.length));
+  state.rockets = [];
+  state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
+  state.balloons = state.layout.balloons.map((b) => ({ id: b.id, x: b.x, y: b.y, z: b.z, tint: b.tint, alive: true, respawnAt: 0 }));
+  state.phase = 'playing';
+  state.roundEndsAt = Date.now() + ROUND_SECONDS * 1000;
+  state.lastResults = null;
+  io.emit('roundStart', roundStartPayload());
+  broadcastLobby();
+  console.log(`[round] started mode=${state.settings.mode} preset=${state.settings.preset} bots=${state.settings.bots} seed=${state.seed} players=${all.length}`);
+}
+
+function endRound() {
+  if (state.phase !== 'playing') return;
+  state.phase = 'ended';
+  state.endedAt = Date.now();
+  const results = [...state.players.values()]
+    .map((p) => ({ id: p.id, name: p.name, color: p.color, isBot: p.isBot, score: Math.round(p.score) }))
+    .sort((a, b) => b.score - a.score);
+  state.lastResults = { mode: state.settings.mode, results, endedAt: state.endedAt };
+  io.emit('roundEnd', state.lastResults);
+  console.log('[round] ended:', results.map((r) => `${r.name}=${r.score}`).join(', '));
+}
+
+function returnToLobby() {
+  state.phase = 'lobby';
+  for (const b of bots()) state.players.delete(b.id);
+  state.rockets = [];
+  state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
+  broadcastLobby();
+}
+
+io.on('connection', (socket) => {
+  let player = null;
+
+  socket.on('join', (data, ack) => {
+    if (player) { if (typeof ack === 'function') ack({ ok: true, id: player.id, lobby: lobbyPayload() }); return; }
+    if (humans().length >= MAX_PLAYERS) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Squadron is full (8 pilots max).' });
+      return;
+    }
+    const safe = data && typeof data === 'object' ? data : {};
+    let name = String(safe.name || '').slice(0, 14).replace(/[^\w\- ]/g, '').trim();
+    if (!name) name = CALLSIGNS[Math.floor(Math.random() * CALLSIGNS.length)];
+    // Keep callsigns unique
+    const taken = new Set([...state.players.values()].map((p) => p.name));
+    let unique = name; let n = 2;
+    while (taken.has(unique)) unique = `${name} ${n++}`;
+    const color = clamp(parseInt(safe.color, 10) || 0, 0, 7);
+    player = makePlayer(socket.id, unique, color, false);
+    state.players.set(socket.id, player);
+    state.joinOrder.push(socket.id);
+    pickHost();
+    if (state.phase === 'playing') {
+      // Drop-in mid-round
+      spawnPlayer(player, state.players.size - 1, state.players.size);
+      socket.emit('roundStart', roundStartPayload());
+    }
+    if (typeof ack === 'function') ack({ ok: true, id: socket.id, lobby: lobbyPayload() });
+    broadcastLobby();
+    console.log(`[join] ${unique} (${socket.id}) host=${state.hostId === socket.id}`);
+  });
+
+  socket.on('setSettings', (data) => {
+    if (!player || socket.id !== state.hostId || !data || typeof data !== 'object') return;
+    let changedPreset = false;
+    if (MODES.includes(data.mode)) state.settings.mode = data.mode;
+    if (PRESETS.includes(data.preset) && data.preset !== state.settings.preset) { state.settings.preset = data.preset; changedPreset = true; }
+    if ([0, 2, 3, 4].includes(Number(data.bots))) state.settings.bots = Number(data.bots);
+    if (changedPreset) io.emit('preset', { preset: state.settings.preset });
+    broadcastLobby();
+  });
+
+  socket.on('startRound', () => {
+    if (!player || socket.id !== state.hostId) return;
+    if (state.phase === 'lobby') startRound();
+  });
+
+  socket.on('state', (s) => {
+    if (!player || state.phase !== 'playing' || !s || typeof s !== 'object') return;
+    const p = Array.isArray(s.p) ? s.p : null;
+    const q = Array.isArray(s.q) ? s.q : null;
+    if (!p || p.length < 3 || !q || q.length < 4) return;
+    const np = { x: +p[0] || 0, y: +p[1] || 0, z: +p[2] || 0 };
+    // Sanity clamp: never allow more than ~2x super speed of travel per report, keep inside the world
+    const maxStep = SPEED_SUPER * 2 * 0.25;
+    const d = dist(np, player.pos);
+    if (d > maxStep) {
+      const k = maxStep / d;
+      np.x = player.pos.x + (np.x - player.pos.x) * k;
+      np.y = player.pos.y + (np.y - player.pos.y) * k;
+      np.z = player.pos.z + (np.z - player.pos.z) * k;
+    }
+    np.y = clamp(np.y, WATER_LEVEL + 1, CEILING + 20);
+    const hr = Math.hypot(np.x, np.z);
+    if (hr > WORLD_RADIUS + 60) { const k = (WORLD_RADIUS + 60) / hr; np.x *= k; np.z *= k; }
+    player.pos = np;
+    player.quat = { x: +q[0] || 0, y: +q[1] || 0, z: +q[2] || 0, w: +q[3] || 1 };
+    player.yaw = +s.yaw || 0;
+    player.pitch = +s.pitch || 0;
+    player.roll = +s.roll || 0;
+    player.speed = clamp(+s.spd || SPEED_BASE, 0, SPEED_SUPER + 10);
+    player.boost = Boolean(s.boost);
+    player.stamina = clamp(+s.st || 0, 0, 1);
+    player.lastSeen = now();
+  });
+
+  socket.on('fire', () => {
+    if (!player || state.phase !== 'playing') return;
+    tryFire(player);
+  });
+
+  socket.on('barrelRoll', () => {
+    if (!player || state.phase !== 'playing') return;
+    const t = now();
+    if (t < player.rollingUntil) return;
+    player.rollingUntil = t + BARREL_ROLL_TIME;
+    io.emit('roll', { id: player.id });
+  });
+
+  socket.on('disconnect', () => {
+    if (!player) return;
+    const wasHolder = state.crown.holderId === player.id;
+    state.players.delete(player.id);
+    state.joinOrder = state.joinOrder.filter((id) => id !== player.id);
+    if (wasHolder) dropCrown(player.pos);
+    if (state.hostId === player.id) { state.hostId = null; pickHost(); }
+    console.log(`[leave] ${player.name}`);
+    if (humans().length === 0 && state.phase !== 'lobby') {
+      // Nobody left: reset so the next visitor gets a clean lobby
+      state.phase = 'lobby';
+      for (const b of bots()) state.players.delete(b.id);
+      state.rockets = [];
+    }
+    broadcastLobby();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rockets, crown, balloons, gates
+// ---------------------------------------------------------------------------
+function tryFire(p) {
+  const t = now();
+  const cd = t < p.superUntil ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
+  if (t - p.lastFire < cd - 0.05) return false;
+  p.lastFire = t;
+  const dir = forwardFromYP(p.yaw, p.pitch);
+  const start = vadd(p.pos, vscale(dir, 5));
+  state.rockets.push({ id: state.rocketSeq++, owner: p.id, p: start, d: dir, born: t, target: null, targetKind: null });
+  io.emit('shot', { id: p.id, p: [r2(start.x), r2(start.y), r2(start.z)] });
+  return true;
+}
+
+function dropCrown(pos) {
+  state.crown.holderId = null;
+  state.crown.pos = { x: pos.x, y: Math.max(pos.y, 40), z: pos.z };
+  state.crown.ribbon = [];
+  io.emit('crown', { holderId: null, by: null, how: 'dropped', pos: state.crown.pos });
+}
+
+function giveCrown(toId, how, fromId) {
+  const t = now();
+  state.crown.holderId = toId;
+  state.crown.ribbon = [];
+  const p = state.players.get(toId);
+  if (p) {
+    p.burstUntil = t + CROWN_BURST_TIME;
+    p.invulnUntil = t + CROWN_BURST_TIME;
+  }
+  io.emit('crown', { holderId: toId, by: toId, from: fromId || null, how });
+}
+
+function findHomingTarget(r) {
+  let best = null;
+  let bestAng = HOMING_CONE;
+  const consider = (pos, id, kind) => {
+    const to = vsub(pos, r.p);
+    const d = vlen(to);
+    if (d > HOMING_RANGE || d < 0.01) return;
+    const ang = Math.acos(clamp(vdot(r.d, vscale(to, 1 / d)), -1, 1));
+    if (ang < bestAng) { bestAng = ang; best = { id, kind }; }
+  };
+  for (const p of state.players.values()) {
+    if (p.id === r.owner) continue;
+    consider(p.pos, p.id, 'player');
+  }
+  if (state.settings.mode === 'blitz') {
+    for (const b of state.balloons) if (b.alive) consider(b, b.id, 'balloon');
+  }
+  return best;
+}
+
+function stepRockets(dt, t) {
+  const alive = [];
+  for (const r of state.rockets) {
+    if (t - r.born > ROCKET_LIFE) continue;
+    if (!r.target) {
+      const tg = findHomingTarget(r);
+      if (tg) { r.target = tg.id; r.targetKind = tg.kind; }
+    }
+    if (r.target) {
+      let tpos = null;
+      if (r.targetKind === 'player') { const tp = state.players.get(r.target); tpos = tp ? tp.pos : null; }
+      else { const b = state.balloons[r.target]; tpos = b && b.alive ? b : null; }
+      if (!tpos) { r.target = null; }
+      else {
+        const to = vnorm(vsub(tpos, r.p));
+        const cosA = clamp(vdot(r.d, to), -1, 1);
+        const ang = Math.acos(cosA);
+        if (ang > Math.PI / 2 + 0.3) { r.target = null; }
+        else if (ang > 0.0005) {
+          const step = Math.min(ang, HOMING_TURN * dt);
+          const perp = vnorm(vsub(to, vscale(r.d, cosA)));
+          r.d = vnorm(vadd(vscale(r.d, Math.cos(step)), vscale(perp, Math.sin(step))));
+        }
+      }
+    }
+    r.p = vadd(r.p, vscale(r.d, ROCKET_SPEED * dt));
+    let dead = false;
+    // Player hits / deflections
+    for (const p of state.players.values()) {
+      if (p.id === r.owner) continue;
+      const d = dist(p.pos, r.p);
+      if (d < 16 && t < p.rollingUntil && !r.deflected) {
+        // Barrel roll deflects the rocket away from the dodging jet
+        const away = vnorm(vsub(r.p, p.pos));
+        r.d = vnorm(vadd(vscale(away, 0.8), vscale(r.d, 0.3)));
+        r.target = null;
+        r.deflected = true;
+        r.born = Math.min(r.born, t - ROCKET_LIFE + 1.2);
+        io.emit('deflect', { id: p.id, by: r.owner, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)] });
+        continue;
+      }
+      if (d < 8 && t >= p.invulnUntil && !(t < p.rollingUntil)) {
+        dead = true;
+        const shooter = state.players.get(r.owner);
+        p.tumbleUntil = t + TUMBLE_TIME;
+        let crownStolen = false;
+        if (state.settings.mode === 'crown' && state.crown.holderId === p.id && shooter) {
+          crownStolen = true;
+          giveCrown(shooter.id, 'rocket', p.id);
+        } else if (state.settings.mode === 'blitz' && shooter) {
+          shooter.score += 5;
+        }
+        io.emit('hit', { shooter: r.owner, victim: p.id, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], crownStolen });
+        break;
+      }
+    }
+    if (!dead && state.settings.mode === 'blitz') {
+      for (const b of state.balloons) {
+        if (!b.alive) continue;
+        if (dist(b, r.p) < 9) { popBalloon(b, r.owner, t); dead = true; break; }
+      }
+    }
+    if (!dead && islandCollision(r.p, state.layout.islands)) {
+      dead = true;
+      io.emit('boom', { p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)] });
+    }
+    if (!dead && r.p.y < WATER_LEVEL) {
+      dead = true;
+      io.emit('boom', { p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], water: true });
+    }
+    if (!dead) alive.push(r);
+  }
+  state.rockets = alive;
+}
+
+function popBalloon(b, byId, t) {
+  b.alive = false;
+  b.respawnAt = t + BALLOON_RESPAWN_S;
+  const p = state.players.get(byId);
+  if (p) p.score += 10;
+  io.emit('pop', { id: b.id, by: byId, p: [r2(b.x), r2(b.y), r2(b.z)], tint: b.tint });
+}
+
+function stepBalloons(t) {
+  for (const b of state.balloons) {
+    if (b.alive) continue;
+    if (t >= b.respawnAt) {
+      const np = randomBalloonPos(Math.random, state.layout.islands);
+      b.x = np.x; b.y = np.y; b.z = np.z;
+      b.alive = true;
+      io.emit('balloon', { id: b.id, x: r2(b.x), y: r2(b.y), z: r2(b.z), tint: b.tint });
+    }
+  }
+}
+
+function stepGatesAndPickups(t) {
+  const mode = state.settings.mode;
+  for (const p of state.players.values()) {
+    if (mode === 'blitz') {
+      // Balloons popped by flying straight into them
+      for (const b of state.balloons) {
+        if (b.alive && dist(b, p.pos) < 9) popBalloon(b, p.id, t);
+      }
+      // Ring gates: detect crossing the gate plane inside the ring radius
+      for (const a of state.layout.arches) {
+        const rel = { x: p.pos.x - a.x, y: p.pos.y - a.y, z: p.pos.z - a.z };
+        // Gate normal in XZ plane (arch rotated by yaw around Y; torus lies in the plane perpendicular to normal)
+        const nx = Math.sin(a.yaw), nz = Math.cos(a.yaw);
+        const along = rel.x * nx + rel.z * nz;
+        const lateral = Math.hypot(rel.x * nz - rel.z * nx, rel.y);
+        const side = along >= 0 ? 1 : -1;
+        const prev = p.gateSide[a.id];
+        if (prev !== undefined && prev !== side && Math.abs(along) < 30 && lateral < a.gateR + 1.5) {
+          if (!(p.gateCooldown[a.id] > t)) {
+            p.gateCooldown[a.id] = t + 3;
+            p.score += 25;
+            p.superUntil = t + SUPER_TIME;
+            io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)] });
+          }
+        }
+        p.gateSide[a.id] = side;
+      }
+    } else {
+      // Crown mode: pick up a loose crown, or steal through the holder's ribbon contrail
+      const c = state.crown;
+      if (!c.holderId) {
+        if (dist(c.pos, p.pos) < 12) giveCrown(p.id, 'pickup', null);
+      } else if (c.holderId !== p.id && t >= (state.players.get(c.holderId) || {}).invulnUntil) {
+        for (const seg of c.ribbon) {
+          if (t - seg.t < RIBBON_MIN_AGE) continue;
+          if (Math.hypot(seg.x - p.pos.x, seg.y - p.pos.y, seg.z - p.pos.z) < 7) {
+            const prevHolder = c.holderId;
+            const victim = state.players.get(prevHolder);
+            if (victim) victim.tumbleUntil = t + TUMBLE_TIME * 0.5;
+            giveCrown(p.id, 'ribbon', prevHolder);
+            io.emit('hit', { shooter: p.id, victim: prevHolder, p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)], crownStolen: true, ribbon: true });
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+
+function stepCrown(dt, t) {
+  const c = state.crown;
+  if (c.holderId) {
+    const h = state.players.get(c.holderId);
+    if (!h) { dropCrown(c.pos); return; }
+    c.pos = { x: h.pos.x, y: h.pos.y + 5, z: h.pos.z };
+    h.score += dt;
+    // Ribbon contrail trails behind the holder
+    const back = forwardFromYP(h.yaw, h.pitch);
+    c.ribbon.push({ x: h.pos.x - back.x * 4, y: h.pos.y - back.y * 4 + 0.5, z: h.pos.z - back.z * 4, t });
+    if (c.ribbon.length > RIBBON_POINTS) c.ribbon.shift();
+  } else {
+    // Loose crown bobs gently and drifts toward the centre so it is always reachable
+    c.pos.y = clamp(c.pos.y + Math.sin(t * 1.5) * 0.08, 30, 200);
+    c.pos.x = lerp(c.pos.x, 0, dt * 0.05);
+    c.pos.z = lerp(c.pos.z, 0, dt * 0.05);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AI wingman bots
+// ---------------------------------------------------------------------------
+function stepBot(p, dt, t) {
+  const bs = p.bot;
+  const mode = state.settings.mode;
+  let goal = null;
+  let wantFire = false;
+  let wantBoost = false;
+
+  if (t > bs.retarget) {
+    bs.retarget = t + 0.6 + Math.random() * 0.8;
+    bs.targetId = null;
+    if (mode === 'crown') {
+      const c = state.crown;
+      if (c.holderId === p.id) {
+        bs.targetId = 'flee';
+      } else if (c.holderId) {
+        bs.targetId = c.holderId;
+      } else {
+        bs.targetId = 'crown';
+      }
+    } else {
+      // Blitz: nearest balloon, or occasionally an arch for the super-charge
+      let best = null, bestD = Infinity;
+      const preferArch = Math.random() < 0.3;
+      if (preferArch) {
+        for (const a of state.layout.arches) {
+          if (p.gateCooldown[a.id] > t) continue;
+          const d = dist(a, p.pos);
+          if (d < bestD) { bestD = d; best = { kind: 'arch', id: a.id }; }
+        }
+      }
+      if (!best) {
+        for (const b of state.balloons) {
+          if (!b.alive) continue;
+          const d = dist(b, p.pos);
+          if (d < bestD) { bestD = d; best = { kind: 'balloon', id: b.id }; }
+        }
+      }
+      bs.target = best;
+      bs.targetId = best ? `${best.kind}:${best.id}` : null;
+    }
+  }
+
+  if (mode === 'crown') {
+    if (bs.targetId === 'flee') {
+      // Run away from the nearest pursuer, weaving around the archipelago
+      let nearest = null, nd = Infinity;
+      for (const o of state.players.values()) {
+        if (o.id === p.id) continue;
+        const d = dist(o.pos, p.pos);
+        if (d < nd) { nd = d; nearest = o; }
+      }
+      if (nearest && nd < 260) {
+        const away = vnorm(vsub(p.pos, nearest.pos));
+        goal = vadd(p.pos, vscale(away, 120));
+        goal.y = clamp(goal.y + Math.sin(t * 0.7) * 30, 40, 200);
+        wantBoost = nd < 120 && p.stamina > 0.3;
+      } else {
+        bs.wander += dt * 0.35;
+        goal = { x: Math.cos(bs.wander) * 420, y: 90 + Math.sin(bs.wander * 1.7) * 40, z: Math.sin(bs.wander) * 420 };
+      }
+    } else if (bs.targetId === 'crown') {
+      goal = { ...state.crown.pos };
+    } else if (bs.targetId && state.players.has(bs.targetId)) {
+      const tp = state.players.get(bs.targetId);
+      const lead = forwardFromYP(tp.yaw, tp.pitch);
+      goal = vadd(tp.pos, vscale(lead, 18));
+      const d = dist(tp.pos, p.pos);
+      wantBoost = d > 160 && p.stamina > 0.4;
+      const toT = vnorm(vsub(tp.pos, p.pos));
+      const fwd = forwardFromYP(p.yaw, p.pitch);
+      if (d < 200 && vdot(toT, fwd) > Math.cos(HOMING_CONE * 0.8)) wantFire = true;
+    }
+  } else if (bs.target) {
+    if (bs.target.kind === 'arch') {
+      const a = state.layout.arches[bs.target.id];
+      const nx = Math.sin(a.yaw), nz = Math.cos(a.yaw);
+      const rel = { x: p.pos.x - a.x, z: p.pos.z - a.z };
+      const along = rel.x * nx + rel.z * nz;
+      const side = along >= 0 ? 1 : -1;
+      const d = Math.hypot(rel.x, rel.z);
+      // Line up with the gate from ~90 units out before diving through it
+      if (d > 50) goal = { x: a.x + nx * side * 80, y: a.y, z: a.z + nz * side * 80 };
+      else goal = { x: a.x - nx * side * 60, y: a.y, z: a.z - nz * side * 60 };
+    } else {
+      const b = state.balloons[bs.target.id];
+      if (b && b.alive) {
+        goal = { x: b.x, y: b.y, z: b.z };
+        const toT = vnorm(vsub(b, p.pos));
+        const fwd = forwardFromYP(p.yaw, p.pitch);
+        if (dist(b, p.pos) < 180 && vdot(toT, fwd) > Math.cos(HOMING_CONE * 0.7)) wantFire = true;
+      } else {
+        bs.retarget = 0;
+      }
+    }
+  }
+  if (!goal) {
+    bs.wander += dt * 0.3;
+    goal = { x: Math.cos(bs.wander) * 380, y: 100, z: Math.sin(bs.wander) * 380 };
+  }
+
+  // Obstacle avoidance: look ahead for islands and climb over them
+  const fwd = forwardFromYP(p.yaw, p.pitch);
+  const ahead = vadd(p.pos, vscale(fwd, 70));
+  const hitAhead = islandCollision(ahead, state.layout.islands);
+  if (hitAhead) {
+    goal = { x: ahead.x + hitAhead.n.x * 80, y: Math.max(ahead.y + 60, hitAhead.island.cy + hitAhead.island.ry + 25), z: ahead.z + hitAhead.n.z * 80 };
+  }
+  if (p.pos.y < 22) goal.y = Math.max(goal.y, p.pos.y + 50);
+  if (Math.hypot(p.pos.x, p.pos.z) > WORLD_RADIUS - 100 && !hitAhead) goal = { x: 0, y: 100, z: 0 };
+
+  const to = vnorm(vsub(goal, p.pos));
+  const targetYaw = Math.atan2(-to.x, -to.z);
+  const targetPitch = clamp(Math.asin(clamp(to.y, -1, 1)), -0.6, 0.6);
+  const yawErr = wrapAngle(targetYaw - p.yaw);
+  const joyX = clamp(-yawErr / 0.5, -1, 1);
+  const joyY = clamp(-targetPitch / 0.75, -1, 1);
+  p.joy = { x: joyX, y: joyY };
+  p.boost = wantBoost;
+
+  stepFlight(p, joyX, joyY, wantBoost, dt, t);
+
+  if (wantFire) tryFire(p);
+  // Occasionally barrel roll when a rocket is homing in
+  if (t >= p.rollingUntil) {
+    for (const r of state.rockets) {
+      if (r.target === p.id && r.targetKind === 'player' && dist(r.p, p.pos) < 45 && Math.random() < 0.08) {
+        p.rollingUntil = t + BARREL_ROLL_TIME;
+        io.emit('roll', { id: p.id });
+        break;
+      }
+    }
+  }
+}
+
+/** Shared arcade flight model (the client runs the same maths for its own jet). */
+function stepFlight(p, joyX, joyY, boost, dt, t) {
+  const sup = t < p.superUntil;
+  const burst = t < p.burstUntil;
+  if (boost && p.stamina > 0.02) p.stamina = Math.max(0, p.stamina - dt * 0.45);
+  else { boost = false; p.stamina = Math.min(1, p.stamina + dt * 0.28); }
+  p.boost = boost;
+  const target = sup ? SPEED_SUPER : (boost || burst) ? SPEED_BOOST : SPEED_BASE;
+  p.speed = lerp(p.speed, target, Math.min(1, dt * 3));
+  p.yaw += -joyX * 2.1 * dt;
+  p.yaw = wrapAngle(p.yaw);
+  p.pitch = lerp(p.pitch, -joyY * 0.75, Math.min(1, dt * 6));
+  p.roll = lerp(p.roll, -joyX * 1.05, Math.min(1, dt * 8));
+  const fwd = forwardFromYP(p.yaw, p.pitch);
+  p.pos = vadd(p.pos, vscale(fwd, p.speed * dt));
+  if (p.pos.y < WATER_LEVEL + 3) { p.pitch = 0.35; p.pos.y = Math.max(p.pos.y, WATER_LEVEL + 1.5); }
+  if (p.pos.y > CEILING) { p.pos.y = CEILING; p.pitch = Math.min(p.pitch, -0.1); }
+  const hit = islandCollision(p.pos, state.layout.islands);
+  if (hit) {
+    p.pos = vadd(p.pos, vscale(hit.n, hit.push));
+    const newDir = vnorm(vadd(vscale(hit.n, 0.9), vscale(fwd, 0.35)));
+    p.yaw = Math.atan2(-newDir.x, -newDir.z);
+    p.pitch = clamp(Math.asin(clamp(newDir.y, -1, 1)), -0.5, 0.6);
+  }
+  const hr = Math.hypot(p.pos.x, p.pos.z);
+  if (hr > WORLD_RADIUS) {
+    const inward = Math.atan2(p.pos.x, p.pos.z);
+    p.yaw = lerp(p.yaw, wrapAngle(inward), Math.min(1, dt * 2));
+  }
+  let visualRoll = p.roll;
+  if (t < p.rollingUntil) visualRoll += ((p.rollingUntil - t) / BARREL_ROLL_TIME) * Math.PI * 2;
+  p.quat = quatFromYPR(p.yaw, p.pitch, visualRoll);
+}
+
+// ---------------------------------------------------------------------------
+// 20Hz tick
+// ---------------------------------------------------------------------------
+let lastTick = now();
+function snapshot(t) {
+  const c = state.crown;
+  return {
+    t: Date.now(),
+    phase: state.phase,
+    mode: state.settings.mode,
+    timeRemaining: r2(Math.max(0, (state.roundEndsAt - Date.now()) / 1000)),
+    crownHolderId: c.holderId,
+    crownPos: [r2(c.pos.x), r2(c.pos.y), r2(c.pos.z)],
+    ribbon: c.ribbon.map((s) => [r2(s.x), r2(s.y), r2(s.z)]),
+    players: [...state.players.values()].map((p) => ({
+      id: p.id,
+      p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)],
+      q: [r3(p.quat.x), r3(p.quat.y), r3(p.quat.z), r3(p.quat.w)],
+      spd: r2(p.speed),
+      sc: Math.round(p.score),
+      b: p.boost ? 1 : 0,
+      su: t < p.superUntil ? r2(p.superUntil - t) : 0,
+      iv: t < p.invulnUntil ? 1 : 0,
+      tu: t < p.tumbleUntil ? r2(p.tumbleUntil - t) : 0,
+      rl: t < p.rollingUntil ? r2(p.rollingUntil - t) : 0,
+      st: r2(p.stamina),
+    })),
+    rockets: state.rockets.map((r) => ({ id: r.id, o: r.owner, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], d: [r3(r.d.x), r3(r.d.y), r3(r.d.z)] })),
+    balloons: state.settings.mode === 'blitz' ? state.balloons.map((b) => (b.alive ? 1 : 0)) : [],
+  };
+}
+
+function tick() {
+  const t = now();
+  const dt = Math.min(0.1, t - lastTick);
+  lastTick = t;
+  if (state.phase === 'playing') {
+    for (const b of bots()) stepBot(b, dt, t);
+    stepRockets(dt, t);
+    stepCrown(dt, t);
+    stepGatesAndPickups(t);
+    stepBalloons(t);
+    io.emit('snap', snapshot(t));
+    if (Date.now() >= state.roundEndsAt) endRound();
+  } else if (state.phase === 'ended') {
+    if (Date.now() - state.endedAt > ROUND_END_SHOW_MS) returnToLobby();
+  }
+}
+setInterval(tick, TICK_MS);
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+server.listen(PORT, '0.0.0.0', () => {
+  const lan = detectLanIPv4();
+  console.log('========================================================');
+  console.log('  SUNSET SQUADRON: CROWN CHASE');
+  console.log(`  Local:   http://localhost:${PORT}`);
+  console.log(`  LAN:     http://${lan}:${PORT}`);
+  if (PUBLIC_URL) console.log(`  Public:  ${PUBLIC_URL}`);
+  console.log(`  Seed:    ${state.seed}`);
+  console.log('  Scan the QR code in the lobby to join from an iPad.');
+  console.log('========================================================');
+});
+
+process.on('SIGINT', () => { console.log('\n[server] shutting down'); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 500); });
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 500); });

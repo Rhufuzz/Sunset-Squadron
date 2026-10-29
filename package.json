@@ -1,0 +1,20 @@
+{
+  "name": "sunset-squadron-crown-chase",
+  "version": "1.0.0",
+  "description": "Sunset Squadron: Crown Chase - zero-asset procedural multiplayer 3D jet arcade game for iPads on a shared network",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && for f in public/js/*.js; do node --check \"$f\"; done"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "qrcode": "^1.5.3",
+    "socket.io": "^4.7.5",
+    "three": "^0.164.1"
+  },
+  "license": "MIT"
+}
