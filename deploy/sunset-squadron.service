@@ -1,0 +1,18 @@
+[Unit]
+Description=Sunset Squadron: Crown Chase
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sunset-squadron
+Environment=NODE_ENV=production
+Environment=PORT=4000
+ExecStart=/usr/bin/node /root/sunset-squadron/server.js
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
