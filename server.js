@@ -228,6 +228,28 @@ function generateCourse(seed, layout) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-round seeded weather
+// ---------------------------------------------------------------------------
+const WEATHER_TYPES = ['clear', 'breeze', 'gusty'];
+const WEATHER_LABELS = { clear: '☀️ CLEAR', breeze: '💨 BREEZE', gusty: '🌧️ GUSTY' };
+function generateWeather(seed) {
+  const rand = mulberry32((seed ^ 0x5a5a5a5a) >>> 0);
+  const type = WEATHER_TYPES[Math.floor(rand() * WEATHER_TYPES.length)];
+  let speed = 0;
+  let wind = { x: 0, y: 0, z: 0 };
+  if (type === 'breeze') {
+    speed = 1.8;
+    const ang = rand() * Math.PI * 2;
+    wind = { x: r2(Math.cos(ang) * speed), y: 0, z: r2(Math.sin(ang) * speed) };
+  } else if (type === 'gusty') {
+    speed = 3.6; // ~7.5% of SPEED_BASE (48), capped under 8%
+    const ang = rand() * Math.PI * 2;
+    wind = { x: r2(Math.cos(ang) * speed), y: 0, z: r2(Math.sin(ang) * speed) };
+  }
+  return { type, speed, wind, label: WEATHER_LABELS[type] };
+}
+
+// ---------------------------------------------------------------------------
 // Small vector / orientation helpers (match THREE Euler order 'YXZ')
 // ---------------------------------------------------------------------------
 function quatFromYPR(yaw, pitch, roll) {
@@ -296,11 +318,13 @@ const state = {
   balloons: [],
   pickups: [],
   race: null,                   // race mode: { course: [...gates], finishCount }
+  weather: null,
   roundEndsAt: 0,
   endedAt: 0,
   lastResults: null,
 };
 state.layout = generateLayout(state.seed);
+state.weather = generateWeather(state.seed);
 
 function now() { return Date.now() / 1000; }
 
@@ -758,6 +782,7 @@ function roundStartPayload() {
     seed: state.seed,
     mode: state.settings.mode,
     preset: state.settings.preset,
+    weather: state.weather,
     endsAt: state.roundEndsAt,
     serverNow: Date.now(),
     balloons: state.balloons.map((b) => ({ id: b.id, x: r2(b.x), y: r2(b.y), z: r2(b.z), alive: b.alive, tint: b.tint })),
@@ -775,6 +800,7 @@ function startRound() {
   // New world every round so the archipelago stays fresh
   state.seed = (Math.random() * 0x7fffffff) >>> 0;
   state.layout = generateLayout(state.seed);
+  state.weather = generateWeather(state.seed);
   // Remove previous bots, add new ones
   for (const b of bots()) state.players.delete(b.id);
   // Bots get random pilots, preferring ones no human picked so the sky stays colourful
@@ -1564,6 +1590,9 @@ function stepFlight(p, joyX, joyY, boost, dt, t) {
   p.roll = lerp(p.roll, -joyX * 1.05, Math.min(1, dt * 8));
   const fwd = forwardFromYP(p.yaw, p.pitch);
   p.pos = vadd(p.pos, vscale(fwd, p.speed * dt));
+  if (state.weather && state.weather.wind) {
+    p.pos = vadd(p.pos, vscale(state.weather.wind, dt));
+  }
   if (p.pos.y < WATER_LEVEL + 3) { p.pitch = 0.35; p.pos.y = Math.max(p.pos.y, WATER_LEVEL + 1.5); }
   if (p.pos.y > CEILING) { p.pos.y = CEILING; p.pitch = Math.min(p.pitch, -0.1); }
   const hit = islandCollision(p.pos, state.layout.islands);

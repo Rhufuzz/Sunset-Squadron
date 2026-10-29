@@ -273,6 +273,7 @@ html, body {
 .hud-pill.timer.urgent { color: #ff6b6b; animation: pulse 0.6s infinite alternate; }
 @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.06); } }
 #hud-crown { color: var(--gold); }
+#hud-weather { font-size: 13px; color: rgba(255, 246, 232, 0.9); }
 
 .hud-left {
   position: absolute;

@@ -77,6 +77,7 @@ const ui = {
   modeToggle: $('mode-toggle'), presetToggle: $('preset-toggle'), botsToggle: $('bots-toggle'),
   hudMode: $('hud-mode'), hudTimer: $('hud-timer'), hudCrown: $('hud-crown'), hudName: $('hud-name'), hudCallsign: $('hud-callsign'), hudPortrait: $('hud-portrait'), hudScore: $('hud-score'),
   hudStamina: $('hud-stamina'), hudCooldown: $('hud-cooldown'), hudSpeed: $('hud-speed'), hudBoard: $('hud-board'), hudPowerups: $('hud-powerups'),
+  hudWeather: $('hud-weather'),
   hudFeed: $('hud-feed'), hudBanner: $('hud-banner'), crownArrow: $('crown-arrow'),
   resultsTitle: $('results-title'), resultsList: $('results-list'), resultsBests: $('results-bests'),
   joyBase: $('joy-base'), joyKnob: $('joy-knob'), btnBoost: $('btn-boost'), btnFire: $('btn-fire'),
@@ -104,6 +105,8 @@ const game = {
   rosterEditing: false,
   mode: 'crown',
   preset: 'sunset',
+  weather: null,
+  windVec: new THREE.Vector3(),
   seed: 1,
   endsAt: 0,
   serverOffset: 0,
@@ -636,6 +639,10 @@ function startRound(data) {
   buildWorld(data.seed);
   gfx.applyPreset(data.preset);
 
+  game.weather = data.weather || { type: 'clear', speed: 0, wind: { x: 0, y: 0, z: 0 }, label: '☀️ CLEAR' };
+  game.windVec.set(game.weather.wind.x || 0, 0, game.weather.wind.z || 0);
+  if (ui.hudWeather) ui.hudWeather.textContent = game.weather.label;
+
   for (const p of data.players) game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot });
 
   // Local jet
@@ -1150,6 +1157,7 @@ function stepLocalFlight(dt) {
   me.roll = lerp(me.roll, -joyX * 1.05, Math.min(1, dt * 8));
   forwardFromYP(tmpV, me.yaw, me.pitch);
   me.pos.addScaledVector(tmpV, me.speed * dt);
+  if (game.windVec) me.pos.addScaledVector(game.windVec, dt);
 
   // Soft ocean bounce
   if (me.pos.y < WATER_LEVEL + 3) {
@@ -1331,6 +1339,25 @@ function frame(nowMs) {
   if (game.phase === 'playing') {
     stepLocalFlight(dt);
     stepRemote(dt);
+    if (game.weather && game.weather.type === 'gusty') {
+      const wx = game.weather.wind.x || 0, wz = game.weather.wind.z || 0;
+      for (let i = 0; i < 3; i++) {
+        const rx = (Math.random() - 0.5) * 60;
+        const ry = 15 + Math.random() * 25;
+        const rz = (Math.random() - 0.5) * 60;
+        tmpV2.set(rx, ry, rz).applyQuaternion(gfx.camera.quaternion).add(gfx.camera.position);
+        gfx.particles.spawn({
+          pos: tmpV2,
+          vel: { x: wx * 2 - 5, y: -80, z: wz * 2 - 5 },
+          life: 0.35,
+          size: 0.5,
+          drag: 0.05,
+          gravity: 8,
+          colors: [new THREE.Color(0xa5d8ff), new THREE.Color(0x74c0fc), new THREE.Color(0x4dabf7)],
+          glow: 1.0,
+        });
+      }
+    }
     if (game.lastSnapAt) game.timeRemaining = Math.max(0, game.timeRemaining - dt);
     const txt = formatTime(game.timeRemaining);
     if (txt !== timerText) {
