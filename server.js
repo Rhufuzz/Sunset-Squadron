@@ -811,7 +811,7 @@ function startRound() {
     const pilot = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
     const id = `bot-${i + 1}`;
     const b = makePlayer(id, BOT_NAMES[i % BOT_NAMES.length], pilot, true);
-    b.bot = { targetId: null, fleeUntil: 0, retarget: 0, wander: 0, boostUntil: 0, pickupId: null };
+    b.bot = { targetId: null, fleeUntil: 0, retarget: 0, wander: 0, boostUntil: 0, pickupId: null, ribbonRoute: false };
     state.players.set(id, b);
   }
   const all = [...state.players.values()];
@@ -1418,10 +1418,15 @@ function stepBot(p, dt, t) {
       const c = state.crown;
       if (c.holderId === p.id) {
         bs.targetId = 'flee';
+        bs.ribbonRoute = false;
       } else if (c.holderId) {
         bs.targetId = c.holderId;
+        // In crown mode, bots occasionally route through the holder's ribbon trail instead of shooting
+        const hasRibbon = c.ribbon && c.ribbon.length >= 6;
+        bs.ribbonRoute = hasRibbon && Math.random() < 0.35;
       } else {
         bs.targetId = 'crown';
+        bs.ribbonRoute = false;
       }
     } else if (mode === 'race') {
       // Course is computed per-frame below; retargeting is only used for pickups (skipped while racing)
@@ -1470,18 +1475,30 @@ function stepBot(p, dt, t) {
     wantBoost = hasFx(p, 'turbo', t);
   } else if (mode === 'crown') {
     if (bs.targetId === 'flee') {
-      // Run away from the nearest pursuer, weaving around the archipelago
-      let nearest = null, nd = Infinity;
-      for (const o of state.players.values()) {
-        if (o.id === p.id) continue;
-        const d = dist(o.pos, p.pos);
-        if (d < nd) { nd = d; nearest = o; }
+      // Crown-holders evade: boost away from nearest threat (pursuer or incoming rocket)
+      let nearestThreat = null, nd = Infinity;
+      for (const r of state.rockets) {
+        if (r.target === p.id && r.targetKind === 'player') {
+          const rd = dist(r.p, p.pos);
+          if (rd < nd) { nd = rd; nearestThreat = { pos: r.p, rocket: true }; }
+        }
       }
-      if (nearest && nd < 260) {
-        const away = vnorm(vsub(p.pos, nearest.pos));
-        goal = vadd(p.pos, vscale(away, 120));
-        goal.y = clamp(goal.y + Math.sin(t * 0.7) * 30, 40, 200);
-        wantBoost = nd < 120 && p.stamina > 0.3;
+      for (const o of state.players.values()) {
+        if (o.id === p.id || o.gone) continue;
+        const d = dist(o.pos, p.pos);
+        if (d < nd) { nd = d; nearestThreat = { pos: o.pos, player: o }; }
+      }
+      if (nearestThreat && nd < 280) {
+        const away = vnorm(vsub(p.pos, nearestThreat.pos));
+        const weaveX = -away.z * Math.sin(t * 2.5) * 45;
+        const weaveZ = away.x * Math.sin(t * 2.5) * 45;
+        goal = {
+          x: p.pos.x + away.x * 130 + weaveX,
+          y: clamp(p.pos.y + Math.sin(t * 1.8) * 35, 45, 210),
+          z: p.pos.z + away.z * 130 + weaveZ,
+        };
+        // Actively boost away from threats
+        wantBoost = (nd < 200 || p.stamina > 0.45) && p.stamina > 0.12;
       } else {
         bs.wander += dt * 0.35;
         goal = { x: Math.cos(bs.wander) * 420, y: 90 + Math.sin(bs.wander * 1.7) * 40, z: Math.sin(bs.wander) * 420 };
@@ -1490,13 +1507,37 @@ function stepBot(p, dt, t) {
       goal = { ...state.crown.pos };
     } else if (bs.targetId && state.players.has(bs.targetId)) {
       const tp = state.players.get(bs.targetId);
-      const lead = forwardFromYP(tp.yaw, tp.pitch);
-      goal = vadd(tp.pos, vscale(lead, 18));
-      const d = dist(tp.pos, p.pos);
-      wantBoost = d > 160 && p.stamina > 0.4;
-      const toT = vnorm(vsub(tp.pos, p.pos));
-      const fwd = forwardFromYP(p.yaw, p.pitch);
-      if (d < 200 && vdot(toT, fwd) > Math.cos(HOMING_CONE * 0.8)) wantFire = true;
+      const c = state.crown;
+      let routedRibbon = false;
+      if (bs.ribbonRoute && c.holderId === tp.id && c.ribbon && c.ribbon.length >= 6) {
+        // Route through the holder's ribbon trail instead of shooting
+        let bestSeg = null, bestSegD = Infinity;
+        for (let i = 0; i < c.ribbon.length; i++) {
+          const seg = c.ribbon[i];
+          if (t - seg.t < RIBBON_MIN_AGE) continue;
+          const d = dist(seg, p.pos);
+          if (d < bestSegD) { bestSegD = d; bestSeg = seg; }
+        }
+        if (bestSeg) {
+          routedRibbon = true;
+          goal = { x: bestSeg.x, y: bestSeg.y, z: bestSeg.z };
+          wantBoost = bestSegD > 30 && p.stamina > 0.25;
+          wantFire = false;
+        }
+      }
+      if (!routedRibbon) {
+        // Lead-target aiming: calculate lead position using relative velocity
+        const tDir = forwardFromYP(tp.yaw, tp.pitch);
+        const tVel = vscale(tDir, tp.speed);
+        const d = dist(tp.pos, p.pos);
+        const tHit = clamp(d / ROCKET_SPEED, 0, 1.8);
+        const leadPos = vadd(tp.pos, vscale(tVel, tHit));
+        goal = leadPos;
+        wantBoost = d > 160 && p.stamina > 0.4;
+        const toLead = vnorm(vsub(leadPos, p.pos));
+        const fwd = forwardFromYP(p.yaw, p.pitch);
+        if (d < 220 && vdot(toLead, fwd) > Math.cos(HOMING_CONE * 0.85)) wantFire = true;
+      }
     }
   } else if (bs.target) {
     if (bs.target.kind === 'arch') {
