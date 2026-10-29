@@ -205,8 +205,6 @@ function islandCollision(pos, islands) {
 }
 
 // ---------------------------------------------------------------------------
-// Game state
-// ---------------------------------------------------------------------------
 const state = {
   phase: 'lobby',               // lobby | playing | ended
   seed: (Math.random() * 0x7fffffff) >>> 0,
@@ -372,6 +370,35 @@ const app = express();
 
 // Self-hosted Three.js (exact version from package.json) — no CDN dependency.
 app.use('/vendor/three', express.static(path.join(__dirname, 'node_modules', 'three'), { etag: true, maxAge: '1d' }));
+
+// Client error logging — /api/client-log
+// Front-end traps (window.onerror / unhandledrejection) POST here so device
+// failures (e.g. an iPad that silently dies) leave a trace on the server.
+const clientLogBuffer = [];
+app.post('/api/client-log', express.json({ limit: '16kb' }), (req, res) => {
+  try {
+    const e = req.body || {};
+    const entry = {
+      at: new Date().toISOString(),
+      ip: (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(),
+      msg: String(e.msg || e.message || '').slice(0, 500),
+      src: String(e.src || e.source || '').slice(0, 300),
+      line: Number(e.line || e.lineno) || 0,
+      col: Number(e.col || e.colno) || 0,
+      stack: String(e.stack || '').slice(0, 1500),
+      ua: String(req.headers['user-agent'] || '').slice(0, 200),
+      url: String(e.url || req.headers.referer || '').slice(0, 300),
+    };
+    if (entry.msg) {
+      clientLogBuffer.push(entry);
+      if (clientLogBuffer.length > 200) clientLogBuffer.shift();
+      console.log('[client-log]', entry.msg, '@', entry.src + ':' + entry.line);
+    }
+  } catch (err) { /* logging must never break the API */ }
+  res.json({ ok: true });
+});
+app.get('/api/client-log', (req, res) => res.json({ entries: clientLogBuffer.slice(-100) }));
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },

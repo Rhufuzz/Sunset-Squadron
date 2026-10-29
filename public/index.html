@@ -10,6 +10,27 @@
   <meta name="apple-mobile-web-app-title" content="Sunset Squadron" />
   <meta name="theme-color" content="#2b1e4a" />
   <meta name="format-detection" content="telephone=no" />
+  <script>
+  /* Early error trap: must load before any module scripts. Reports to /api/client-log. */
+  (function () {
+    function send(payload) {
+      try {
+        var body = JSON.stringify(payload);
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon('/api/client-log', new Blob([body], { type: 'application/json' }));
+        } else {
+          fetch('/api/client-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body, keepalive: true });
+        }
+      } catch (e) { /* never rethrow from the trap */ }
+    }
+    window.addEventListener('error', function (e) {
+      send({ msg: e.message, src: e.filename, line: e.lineno, col: e.colno, stack: e.error && e.error.stack, url: location.href });
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) {
+      send({ msg: 'unhandledrejection: ' + e.reason, stack: e.reason && e.reason.stack, url: location.href });
+    });
+  })();
+  </script>
   <link rel="icon" type="image/png" href="/favicon.ico" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="manifest" href="/manifest.webmanifest" />
