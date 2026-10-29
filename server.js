@@ -1043,7 +1043,9 @@ function stepRockets(dt, t) {
         const ang = Math.acos(cosA);
         if (ang > Math.PI / 2 + 0.3) { r.target = null; }
         else if (ang > 0.0005) {
-          const step = Math.min(ang, HOMING_TURN * dt);
+          const owner = state.players.get(r.owner);
+          const turnMult = owner && owner.perk && owner.perk.homingTurn ? owner.perk.homingTurn : 1;
+          const step = Math.min(ang, HOMING_TURN * turnMult * dt);
           const perp = vnorm(vsub(to, vscale(r.d, cosA)));
           r.d = vnorm(vadd(vscale(r.d, Math.cos(step)), vscale(perp, Math.sin(step))));
         }
@@ -1192,7 +1194,7 @@ function stepGatesAndPickups(t) {
           if (!(p.gateCooldown[a.id] > t)) {
             p.gateCooldown[a.id] = t + 3;
             addScore(p, 25, t);
-            p.superUntil = t + SUPER_TIME;
+            p.superUntil = t + SUPER_TIME * (p.perk && p.perk.superTime ? p.perk.superTime : 1);
             io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)] });
           }
         }
@@ -1415,10 +1417,11 @@ function stepFlight(p, joyX, joyY, boost, dt, t) {
   const burst = t < p.burstUntil;
   const turbo = hasFx(p, 'turbo', t);
   if (turbo) { boost = true; p.stamina = Math.min(1, p.stamina + dt * 0.28 * p.perk.stamRegen); }
-  else if (boost && p.stamina > 0.02) p.stamina = Math.max(0, p.stamina - dt * 0.45);
+  else if (boost && p.stamina > 0.02) p.stamina = Math.max(0, p.stamina - dt * 0.45 * (p.perk.stamDrain || 1));
   else { boost = false; p.stamina = Math.min(1, p.stamina + dt * 0.28 * p.perk.stamRegen); }
   p.boost = boost;
-  const target = sup ? SPEED_SUPER : turbo ? TURBO_SPEED : (boost || burst) ? SPEED_BOOST : SPEED_BASE;
+  const boostSpd = SPEED_BOOST * (p.perk.boostSpeed || 1);
+  const target = sup ? SPEED_SUPER : turbo ? TURBO_SPEED : (boost || burst) ? boostSpd : SPEED_BASE;
   p.speed = lerp(p.speed, target, Math.min(1, dt * 3));
   p.yaw += -joyX * 2.1 * p.perk.turn * dt;
   p.yaw = wrapAngle(p.yaw);

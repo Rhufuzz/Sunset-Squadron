@@ -1067,12 +1067,13 @@ function stepLocalFlight(dt) {
   const turbo = hasFx('turbo');
   const regen = 0.28 * game.perk.stamRegen;
   if (turbo) { boost = true; me.stamina = Math.min(1, me.stamina + dt * regen); }
-  else if (boost && me.stamina > 0.02) me.stamina = Math.max(0, me.stamina - dt * 0.45);
+  else if (boost && me.stamina > 0.02) me.stamina = Math.max(0, me.stamina - dt * 0.45 * (game.perk.stamDrain || 1));
   else { boost = false; me.stamina = Math.min(1, me.stamina + dt * regen); }
   if (boost && !me.wasBoosting) sound.boostWhoosh(0.8);
   me.wasBoosting = boost;
   me.boost = boost;
-  const target = sup ? SPEED_SUPER : turbo ? TURBO_SPEED : (boost || me.invuln) ? SPEED_BOOST : SPEED_BASE;
+  const boostSpd = SPEED_BOOST * (game.perk.boostSpeed || 1);
+  const target = sup ? SPEED_SUPER : turbo ? TURBO_SPEED : (boost || me.invuln) ? boostSpd : SPEED_BASE;
   me.speed = lerp(me.speed, target, Math.min(1, dt * 3));
   me.yaw = wrapAngle(me.yaw + -joyX * 2.1 * game.perk.turn * dt);
   me.pitch = lerp(me.pitch, -joyY * 0.75, Math.min(1, dt * 6));
