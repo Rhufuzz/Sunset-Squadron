@@ -30,6 +30,7 @@ const TICK_MS = 50;                  // 20Hz
 const ROUND_SECONDS = parseInt(process.env.ROUND_SECONDS, 10) || 180;  // 3-minute rounds (override only for testing)
 const ROUND_END_SHOW_MS = 9000;      // scoreboard duration before returning to lobby
 const MAX_PLAYERS = 8;
+const DISCONNECT_GRACE_S = 60;      // how long a disconnected pilot keeps their seat mid-round
 const WORLD_RADIUS = 950;
 const CEILING = 260;
 const WATER_LEVEL = 0;
@@ -246,6 +247,9 @@ function makePlayer(id, name, pilot, isBot) {
     superUntil: 0,
     lastFire: 0,
     lastSeen: now(),
+    clientId: null,               // stable per-browser id (localStorage 'sq_client_id') for mid-round reconnect
+    gone: false,                  // disconnected mid-round; seat held for DISCONNECT_GRACE_S
+    goneAt: 0,
     gateSide: {},
     gateCooldown: {},
     joy: { x: 0, y: 0 },
@@ -253,7 +257,7 @@ function makePlayer(id, name, pilot, isBot) {
   };
 }
 
-function humans() { return [...state.players.values()].filter((p) => !p.isBot); }
+function humans() { return [...state.players.values()].filter((p) => !p.isBot && !p.gone); }
 function bots() { return [...state.players.values()].filter((p) => p.isBot); }
 
 function spawnPlayer(p, index, total) {
@@ -277,6 +281,16 @@ function spawnPlayer(p, index, total) {
   p.stats = { balloons: 0, hits: 0, crownTime: 0, pickups: 0 };
 }
 
+/** Safe mid-round respawn for a reconnecting pilot: new position, same score/stats. */
+function respawnPlayer(p, index, total) {
+  const keepScore = p.score;
+  const keepStats = p.stats;
+  spawnPlayer(p, index, total);
+  p.score = keepScore;
+  p.stats = keepStats;
+  p.invulnUntil = now() + 3;    // brief spawn protection so they aren't instantly shot
+}
+
 /** Is a power-up currently active on this player? */
 function hasFx(p, type, t) { return p.fx[type] !== undefined && p.fx[type] > t; }
 function grantFx(p, type, t) {
@@ -289,7 +303,7 @@ function addScore(p, amount, t) {
   p.score += hasFx(p, 'x2', t) ? amount * 2 : amount;
 }
 function publicPlayer(p) {
-  return { id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, score: Math.round(p.score) };
+  return { id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, gone: Boolean(p.gone), score: Math.round(p.score) };
 }
 
 // ---------------------------------------------------------------------------
@@ -553,9 +567,77 @@ function lobbyPayload() {
 function broadcastLobby() { io.emit('lobby', lobbyPayload()); }
 
 function pickHost() {
-  const list = humans();
-  if (state.hostId && state.players.has(state.hostId)) return;
-  state.hostId = list.length ? list[0].id : null;
+  const connected = (p) => p && !p.isBot && !p.gone;
+  if (state.hostId && connected(state.players.get(state.hostId))) return;
+  // Host = the earliest-joined connected human
+  state.hostId = null;
+  for (const id of state.joinOrder) {
+    if (connected(state.players.get(id))) { state.hostId = id; break; }
+  }
+  if (!state.hostId) {
+    const list = humans();
+    if (list.length) state.hostId = list[0].id;
+  }
+}
+
+/** Re-evaluate the host and tell every client when it changed. */
+function updateHost() {
+  const prev = state.hostId;
+  pickHost();
+  if (state.hostId !== prev) io.emit('hostChange', { hostId: state.hostId });
+}
+
+/** Drop pilots whose reconnect grace has expired (called while a round is playing). */
+function purgeExpiredGone(t) {
+  for (const p of [...state.players.values()]) {
+    if (p.gone && t - p.goneAt > DISCONNECT_GRACE_S) {
+      state.players.delete(p.id);
+      state.joinOrder = state.joinOrder.filter((id) => id !== p.id);
+      console.log(`[gone] ${p.name} did not return - seat freed`);
+    }
+  }
+}
+
+/** Remove every still-disconnected pilot (lobby / new round = clean slate). */
+function removeAllGone() {
+  for (const p of [...state.players.values()]) {
+    if (p.gone) state.players.delete(p.id);
+  }
+  state.joinOrder = state.joinOrder.filter((id) => state.players.has(id));
+}
+
+/**
+ * Socket teardown, shared by 'disconnect' and an explicit 'leave' event.
+ * Mid-round a human's seat is held (gone) for DISCONNECT_GRACE_S so they can
+ * rejoin with their clientId; anywhere else they are removed immediately.
+ */
+function detachPlayer(player) {
+  if (!player) return;
+  const wasHolder = state.crown.holderId === player.id;
+  if (state.phase === 'playing' && !player.isBot) {
+    player.gone = true;
+    player.goneAt = now();
+    player.fx = {};
+    player.rollingUntil = 0;
+    player.tumbleUntil = 0;
+    player.boost = false;
+    player.joy = { x: 0, y: 0 };
+    console.log(`[leave] ${player.name} (seat held ${DISCONNECT_GRACE_S}s for reconnect)`);
+  } else {
+    state.players.delete(player.id);
+    state.joinOrder = state.joinOrder.filter((id) => id !== player.id);
+    console.log(`[leave] ${player.name}`);
+  }
+  if (wasHolder) dropCrown(player.pos);
+  updateHost();
+  if (humans().length === 0 && state.phase !== 'lobby') {
+    // Nobody left: reset so the next visitor gets a clean lobby
+    state.phase = 'lobby';
+    for (const b of bots()) state.players.delete(b.id);
+    removeAllGone();
+    state.rockets = [];
+  }
+  broadcastLobby();
 }
 
 function roundStartPayload() {
@@ -574,6 +656,8 @@ function roundStartPayload() {
 
 function startRound() {
   if (state.phase === 'playing') return;
+  // New round = clean slate: pilots who never rejoined lose their seat
+  removeAllGone();
   // New world every round so the archipelago stays fresh
   state.seed = (Math.random() * 0x7fffffff) >>> 0;
   state.layout = generateLayout(state.seed);
@@ -636,6 +720,7 @@ function endRound() {
 function returnToLobby() {
   state.phase = 'lobby';
   for (const b of bots()) state.players.delete(b.id);
+  removeAllGone();
   state.rockets = [];
   state.pickups = [];
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
@@ -645,13 +730,45 @@ function returnToLobby() {
 io.on('connection', (socket) => {
   let player = null;
 
+
   socket.on('join', (data, ack) => {
     if (player) { if (typeof ack === 'function') ack({ ok: true, id: player.id, lobby: lobbyPayload() }); return; }
-    if (humans().length >= MAX_PLAYERS) {
+    const safe = data && typeof data === 'object' ? data : {};
+    const clientId = typeof safe.clientId === 'string' ? safe.clientId.slice(0, 64) : null;
+    // Mid-round reconnect: same browser, still inside the grace window?
+    let restored = null;
+    if (clientId && state.phase === 'playing') {
+      for (const p of state.players.values()) {
+        if (!p.isBot && p.gone && p.clientId && p.clientId === clientId) { restored = p; break; }
+      }
+    }
+    if (restored) {
+      const oldId = restored.id;
+      state.players.delete(oldId);
+      restored.id = socket.id;
+      restored.clientId = clientId;
+      restored.gone = false;
+      restored.goneAt = 0;
+      restored.lastSeen = now();
+      state.players.set(socket.id, restored);
+      state.joinOrder = state.joinOrder.map((id) => (id === oldId ? socket.id : id));
+      if (state.crown.holderId === oldId) state.crown.holderId = socket.id;
+      player = restored;
+      respawnPlayer(restored, state.players.size - 1, state.players.size);
+      // Ack before roundStart so the client knows its new id when the round payload lands
+      if (typeof ack === 'function') ack({ ok: true, id: socket.id, restored: true, lobby: lobbyPayload() });
+      socket.emit('roundStart', roundStartPayload());
+      broadcastLobby();
+      console.log(`[rejoin] ${restored.name} restored mid-round (score ${Math.round(restored.score)}) as ${socket.id}`);
+      return;
+    }
+    // Capacity: connected humans + seats still held for reconnecting pilots.
+    // A gone pilot's seat frees up for others after DISCONNECT_GRACE_S or when the lobby returns.
+    const seatsUsed = [...state.players.values()].filter((p) => !p.isBot).length;
+    if (seatsUsed >= MAX_PLAYERS) {
       if (typeof ack === 'function') ack({ ok: false, error: 'Squadron is full (8 pilots max).' });
       return;
     }
-    const safe = data && typeof data === 'object' ? data : {};
     // Pilot characters: duplicates are allowed (two friends can both fly as KAYA);
     // the player name keeps everyone distinguishable.
     const pilot = PILOT_IDS.includes(safe.pilot) ? safe.pilot : PILOT_IDS[Math.floor(Math.random() * PILOT_IDS.length)];
@@ -662,15 +779,17 @@ io.on('connection', (socket) => {
     let unique = name; let n = 2;
     while (taken.has(unique)) unique = `${name} ${n++}`;
     player = makePlayer(socket.id, unique, pilot, false);
+    player.clientId = clientId;
     state.players.set(socket.id, player);
     state.joinOrder.push(socket.id);
-    pickHost();
-    if (state.phase === 'playing') {
+    updateHost();
+    const midRound = state.phase === 'playing';
+    if (midRound) {
       // Drop-in mid-round
       spawnPlayer(player, state.players.size - 1, state.players.size);
-      socket.emit('roundStart', roundStartPayload());
     }
     if (typeof ack === 'function') ack({ ok: true, id: socket.id, lobby: lobbyPayload() });
+    if (midRound) socket.emit('roundStart', roundStartPayload());
     broadcastLobby();
     console.log(`[join] ${unique} as ${pilot} (${socket.id}) host=${state.hostId === socket.id}`);
   });
@@ -740,22 +859,9 @@ io.on('connection', (socket) => {
     io.emit('roll', { id: player.id });
   });
 
-  socket.on('disconnect', () => {
-    if (!player) return;
-    const wasHolder = state.crown.holderId === player.id;
-    state.players.delete(player.id);
-    state.joinOrder = state.joinOrder.filter((id) => id !== player.id);
-    if (wasHolder) dropCrown(player.pos);
-    if (state.hostId === player.id) { state.hostId = null; pickHost(); }
-    console.log(`[leave] ${player.name}`);
-    if (humans().length === 0 && state.phase !== 'lobby') {
-      // Nobody left: reset so the next visitor gets a clean lobby
-      state.phase = 'lobby';
-      for (const b of bots()) state.players.delete(b.id);
-      state.rockets = [];
-    }
-    broadcastLobby();
-  });
+  socket.on('disconnect', () => detachPlayer(player));
+
+  socket.on('leave', () => detachPlayer(player));
 });
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1299,7 @@ function snapshot(t) {
     mode: state.settings.mode,
     timeRemaining: r2(Math.max(0, (state.roundEndsAt - Date.now()) / 1000)),
     crownHolderId: c.holderId,
+    hostId: state.hostId,
     crownPos: [r2(c.pos.x), r2(c.pos.y), r2(c.pos.z)],
     ribbon: c.ribbon.map((s) => [r2(s.x), r2(s.y), r2(s.z)]),
     players: [...state.players.values()].map((p) => ({
@@ -1226,6 +1333,9 @@ function tick() {
     stepGatesAndPickups(t);
     stepBalloons(t);
     stepPickups(t);
+    const before = state.players.size;
+    purgeExpiredGone(t);
+    if (state.players.size !== before) broadcastLobby();
     io.emit('snap', snapshot(t));
     if (Date.now() >= state.roundEndsAt) endRound();
   } else if (state.phase === 'ended') {

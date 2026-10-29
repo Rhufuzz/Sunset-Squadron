@@ -26,6 +26,21 @@ const LERP = 0.25;
 
 const MODE_LABEL = { crown: 'CROWN TAG', blitz: 'ARCH & BALLOON BLITZ' };
 
+// Stable per-browser client id: lets the server restore our seat (pilot, name,
+// score) if we drop and rejoin while a round is in progress.
+function getClientId() {
+  let id = null;
+  try { id = localStorage.getItem('sq_client_id'); } catch (err) { /* storage blocked */ }
+  if (!id) {
+    id = (window.crypto && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    try { localStorage.setItem('sq_client_id', id); } catch (err) { /* storage blocked */ }
+  }
+  return id;
+}
+const CLIENT_ID = getClientId();
+
 const $ = (id) => document.getElementById(id);
 const nowS = () => performance.now() / 1000;
 const clamp = THREE.MathUtils.clamp;
@@ -332,6 +347,12 @@ function renderRoster(lobby) {
       tag.textContent = 'HOST';
       li.appendChild(tag);
     }
+    if (p.gone) {
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'RECONNECTING…';
+      li.appendChild(tag);
+    }
     if (p.id === game.myId) {
       li.classList.add('me');
       li.classList.toggle('editing', game.rosterEditing);
@@ -415,6 +436,11 @@ function connectSocket() {
     if (lobby.phase === 'lobby' && game.phase !== 'lobby') enterLobby();
   });
   socket.on('preset', ({ preset }) => { game.preset = preset; gfx.applyPreset(preset); });
+  socket.on('hostChange', ({ hostId }) => {
+    // Host migration: re-render the roster so START ROUND / settings move to the new host
+    if (game.lobby) { game.lobby.hostId = hostId; renderRoster(game.lobby); }
+    if (hostId === game.myId) addFeed('You are the host now!');
+  });
   socket.on('roundStart', (data) => startRound(data));
   socket.on('snap', (snap) => onSnapshot(snap));
   socket.on('roundEnd', (results) => endRound(results));
@@ -451,7 +477,7 @@ function connectSocket() {
 
 function doJoin() {
   if (!socket) return;
-  socket.emit('join', { name: game.playerName, pilot: game.pilotId }, (ack) => {
+  socket.emit('join', { name: game.playerName, pilot: game.pilotId, clientId: CLIENT_ID }, (ack) => {
     launching = false;
     if (!ack || !ack.ok) {
       ui.joinError.textContent = ack && ack.error ? ack.error : 'Could not join.';
@@ -646,6 +672,11 @@ function onSnapshot(snap) {
   game.lastSnapAt = t;
   game.timeRemaining = snap.timeRemaining;
   game.crownHolderId = snap.crownHolderId;
+  // Host migration via snapshot (hostChange event covers it too)
+  if (snap.hostId !== undefined && game.lobby && game.lobby.hostId !== snap.hostId) {
+    game.lobby.hostId = snap.hostId;
+    renderRoster(game.lobby);
+  }
   const seen = new Set();
   for (const p of snap.players) {
     seen.add(p.id);
