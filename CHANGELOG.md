@@ -3,6 +3,24 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.2.0] — 2026-10-29
+
+### Added
+- **Self-hosted Three.js** served at `/vendor/three` from the pinned `three@0.164.1`
+  dependency — the importmap no longer points at jsDelivr, so the game now truly runs
+  with zero internet on players' devices (verified with the CDN blocked). Removes the
+  README's "clients need internet" caveat.
+- **Client error logging:** an early `window.onerror` / `unhandledrejection` trap in
+  `index.html` reports failures to the new `POST /api/client-log` (sendBeacon with
+  fetch fallback). Last 200 entries kept in memory, `GET /api/client-log` to read them;
+  each entry records message, source, line/col, stack, user-agent and IP. Device-side
+  failures (e.g. an iPad that dies silently) now leave a server-side trace.
+- **systemd deployment unit** (`deploy/sunset-squadron.service`) — enabled with
+  `Restart=always`, the server survives crashes and reboots (verified with kill -9).
+
+### Fixed
+- Server no longer dies when the starting shell session ends (systemd owns the process).
+
 ## [1.1.0] — 2026-10-29
 
 ### Added
