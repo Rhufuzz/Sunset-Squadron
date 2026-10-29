@@ -3,6 +3,27 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.5.0] — 2026-10-29
+
+### Added
+- **Unit test suite** (`node:test`, zero new dependencies): 22 tests over
+  `test/logic.test.js` (weather determinism over 200 seeds, PRNG, vector/quat math,
+  island collision, homing angles, gate plane-crossing edge cases, race finish
+  scoring, race result ordering, all 12 pilot perk multipliers, ESM export rendering)
+  and `test/leaderboard.test.js` (stat updates, persistence reload, atomic writes,
+  corrupt-file quarantine, concurrent write serialization). Pure logic extracted
+  verbatim to `server/logic.js`; behavior-preserving (verified by live smoke round).
+- **CI:** GitHub Actions workflow (`.github/workflows/ci.yml`) running `npm ci`,
+  `npm run check` and `npm test` on Node 20 + 22 for every push/PR.
+- **Bandwidth measurement:** snapshots at full 8-player occupancy average ~2 KB
+  (~40 KB/s per client, ~0.32 MB/s server-side at 20 Hz) — within budget, no
+  protocol changes needed.
+
+### Changed
+- `npm run check` now also syntax-checks `server/logic.js` and `leaderboard.js`.
+- README updated for v1.3–v1.5 content (race mode, 12 pilots, 8 power-ups, weather,
+  reconnect/host migration) with a CI badge.
+
 ## [1.4.0] — 2026-10-29
 
 ### Added

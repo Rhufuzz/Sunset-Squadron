@@ -1,14 +1,18 @@
 # Sunset Squadron: Crown Chase
 
 A zero-asset (100 % procedural geometry and audio) multiplayer 3D arcade jet game for up to 8 iPads
-on a shared network. Players join by scanning a QR code in the lobby, pick one of **8 pilot
+on a shared network. Players join by scanning a QR code in the lobby, pick one of **12 pilot
 characters** (each with a signature jet livery, a procedural portrait and a small perk), then chase
-the Golden Crown or pop balloons and dive through neon ring gates in 3-minute rounds while grabbing
-glowing **power-up orbs**. 2–4 server-flown AI wingmen keep the sky busy even with only two iPads,
-and a persistent **all-time leaderboard** remembers every human pilot.
+the Golden Crown, race checkpoint courses or pop balloons and dive through neon ring gates in
+3-minute rounds while grabbing glowing **power-up orbs** — under per-round **weather**. 2–4
+server-flown AI wingmen keep the sky busy even with only two iPads, dropped pilots can reconnect
+mid-round, the host role migrates automatically, and a persistent **all-time leaderboard**
+remembers every human pilot.
+
+[![CI](https://github.com/Rhufuzz/Sunset-Squadron/actions/workflows/ci.yml/badge.svg)](https://github.com/Rhufuzz/Sunset-Squadron/actions/workflows/ci.yml)
 
 - **Server:** Node.js, Express, Socket.io (20 Hz authoritative loop), `qrcode`
-- **Client:** plain ES modules served statically, Three.js 0.164.1 from the jsDelivr CDN via an importmap, Web Audio synthesizer
+- **Client:** plain ES modules served statically, Three.js 0.164.1 self-hosted at `/vendor/three` (no CDN needed), Web Audio synthesizer
 - **No bundler, no build step, no asset files**
 
 ```
@@ -17,7 +21,7 @@ sunset-squadron/
 ├── server.js             # lobby, 20Hz game loop, bots, rockets, crown, balloons, gates, power-ups, QR/host-info
 ├── leaderboard.js        # persistent JSON leaderboard (atomic writes)
 ├── shared/
-│   └── pilots.js         # the 8 pilots, perks and power-up definitions (served to the client as /js/pilots-data.js)
+│   └── pilots.js         # the 12 pilots, perks and power-up definitions (served to the client as /js/pilots-data.js)
 ├── data/
 │   └── leaderboard.json  # created automatically on first start (not part of the zip / git)
 └── public/
@@ -39,6 +43,7 @@ sunset-squadron/
 | --- | --- |
 | **Crown Tag** (default) | One pilot holds the Golden Crown and earns +1 pt / second. Hit the holder with a firework rocket **or fly through their golden ribbon contrail** to steal it. Stealing grants a 3-second invulnerable speed burst. |
 | **Arch & Balloon Blitz** | 40 glowing hot-air balloons (+10 each, pop by rocket or by flying into them) and 12 stone arches with neon ring gates (+25 and an 8-second 2× **Super-Charge** speed / fire-rate buff). |
+| **Checkpoint Race** | A seeded 10-gate course. Your next gate glows gold (the one after, cyan) and an arrow guides you; fly the gates in order — first to finish scores 100 pts, −15 per rank after that (min 25). Rockets are disabled; barrel rolls still dodge nothing but gravity. |
 
 Controls on iPad: left half of the screen is a floating virtual stick (it appears wherever your thumb lands),
 right half has **BOOST** (hold = afterburner, tap = barrel roll that deflects rockets) and **FIREWORK**
@@ -63,6 +68,10 @@ perk** — all perks are multipliers of ±15–50 % on a single stat, so no pilo
 | **BLAZE** | Marco Ferreira | Hot Shot | Rockets lock on from 25 % further away |
 | **COMET** | Yuki Sato | Iron Wings | Recovers from hits twice as fast |
 | **ECHO** | Zara Haddad | Phantom Roll | Barrel rolls last 35 % longer (bigger deflect window) |
+| **ORION** | Orion Cross | Deep Tanks | Boost stamina drains 25 % slower |
+| **VORTEX** | Maya Lin | Gyro Lock | Rockets steer 30 % sharper |
+| **SOLAR** | Tariq Mansour | Arc Surge | Arch Super-Charge lasts 35 % longer |
+| **STRIDE** | Astrid Lind | Afterburner | Boost speed is 15 % faster |
 
 **Duplicates are allowed:** two players may fly the same pilot. Players are told apart by the name
 they type (or the callsign if they leave it blank), so a family of four can all be KAYA if they insist.
@@ -85,6 +94,15 @@ effect runs out. Bots will detour to grab orbs within ~220 m. Power-ups work in 
 | **Magnet** (violet) | 10 s | Much larger pickup, balloon, crown and ribbon-steal range |
 | **Ghost** (lilac) | 8 s | Homing rockets cannot lock on to you |
 | **Score x2** (gold) | 10 s | Every point (crown seconds, balloons, gates) counts double |
+| **Sky Mine** (red) | 25 s | Drops a spiked mine behind your jet; it arms after 1 s and explodes on the first enemy within 14 m (same effect as a rocket hit, you get the credit) |
+| **Decoy Flare** (light blue) | 6 s | Launches a mirror jet on a straight flight path — homing rockets retarget to it; one hit destroys it |
+
+## Weather
+
+Every round is seeded with weather as well as terrain: **☀️ Clear** (no wind), **💨 Breeze**
+(~4 % of base speed as a steady crosswind) or **🌧️ Gusty** (~8 %, plus light rain streaks).
+The wind drift applies to every jet server-side, so all players fight the same air; the
+HUD shows the current conditions in a small pill next to the clock.
 
 ## Leaderboard
 
