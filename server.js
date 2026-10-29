@@ -19,6 +19,12 @@ const { Server } = require('socket.io');
 const QRCode = require('qrcode');
 const PILOT_DATA = require('./shared/pilots');
 const { Leaderboard } = require('./leaderboard');
+const {
+  mulberry32, quatFromYPR, forwardFromYP, wrapAngle,
+  clamp, lerp, vlen, vsub, vdot, vnorm, vscale, vadd, dist, r2, r3,
+  islandCollision, generateWeather, homingAngle,
+  raceFinishPoints, gateCrossing, compareRaceResults,
+} = require('./server/logic');
 const { PILOTS, POWERUPS, POWERUP_TYPES, PILOT_IDS, pilotById, perkMultipliers } = PILOT_DATA;
 
 // ---------------------------------------------------------------------------
@@ -60,9 +66,6 @@ const ROCKET_COOLDOWN_RAPID = 0.4;
 const MAGNET_MULT = 2.2;             // Magnet power-up range multiplier
 
 const RACE_GATES = 10;               // Checkpoint Race: gates per course
-const RACE_FINISH_BASE = 100;        // 1st place points
-const RACE_FINISH_STEP = 15;         // points lost per rank
-const RACE_FINISH_MIN = 25;          // floor for finish points
 const RACE_GATE_R = 11;              // course gate ring radius (slightly bigger than blitz gates)
 
 const BOT_NAMES = ['Wingman Ace', 'Wingman Duke', 'Wingman Pip', 'Wingman Zed'];
@@ -72,17 +75,8 @@ const MODES = ['crown', 'blitz', 'race'];
 
 // ---------------------------------------------------------------------------
 // Shared deterministic world layout (identical code lives in public/js/world.js)
+// mulberry32 and the per-round weather generator live in server/logic.js
 // ---------------------------------------------------------------------------
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 function randomBalloonPos(rand, islands) {
   for (let tries = 0; tries < 20; tries++) {
@@ -228,76 +222,13 @@ function generateCourse(seed, layout) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-round seeded weather
+// Per-round seeded weather: generator lives in server/logic.js
 // ---------------------------------------------------------------------------
-const WEATHER_TYPES = ['clear', 'breeze', 'gusty'];
-const WEATHER_LABELS = { clear: '☀️ CLEAR', breeze: '💨 BREEZE', gusty: '🌧️ GUSTY' };
-function generateWeather(seed) {
-  const rand = mulberry32((seed ^ 0x5a5a5a5a) >>> 0);
-  const type = WEATHER_TYPES[Math.floor(rand() * WEATHER_TYPES.length)];
-  let speed = 0;
-  let wind = { x: 0, y: 0, z: 0 };
-  if (type === 'breeze') {
-    speed = 1.8;
-    const ang = rand() * Math.PI * 2;
-    wind = { x: r2(Math.cos(ang) * speed), y: 0, z: r2(Math.sin(ang) * speed) };
-  } else if (type === 'gusty') {
-    speed = 3.6; // ~7.5% of SPEED_BASE (48), capped under 8%
-    const ang = rand() * Math.PI * 2;
-    wind = { x: r2(Math.cos(ang) * speed), y: 0, z: r2(Math.sin(ang) * speed) };
-  }
-  return { type, speed, wind, label: WEATHER_LABELS[type] };
-}
 
 // ---------------------------------------------------------------------------
-// Small vector / orientation helpers (match THREE Euler order 'YXZ')
+// Small vector / orientation helpers (match THREE Euler order 'YXZ'):
+// moved verbatim to server/logic.js and imported back above.
 // ---------------------------------------------------------------------------
-function quatFromYPR(yaw, pitch, roll) {
-  const c1 = Math.cos(pitch / 2), c2 = Math.cos(yaw / 2), c3 = Math.cos(roll / 2);
-  const s1 = Math.sin(pitch / 2), s2 = Math.sin(yaw / 2), s3 = Math.sin(roll / 2);
-  return {
-    x: s1 * c2 * c3 + c1 * s2 * s3,
-    y: c1 * s2 * c3 - s1 * c2 * s3,
-    z: c1 * c2 * s3 - s1 * s2 * c3,
-    w: c1 * c2 * c3 + s1 * s2 * s3,
-  };
-}
-function forwardFromYP(yaw, pitch) {
-  const cp = Math.cos(pitch);
-  return { x: -cp * Math.sin(yaw), y: Math.sin(pitch), z: -cp * Math.cos(yaw) };
-}
-function wrapAngle(a) {
-  while (a > Math.PI) a -= Math.PI * 2;
-  while (a < -Math.PI) a += Math.PI * 2;
-  return a;
-}
-function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-function lerp(a, b, t) { return a + (b - a) * t; }
-function vlen(v) { return Math.hypot(v.x, v.y, v.z); }
-function vsub(a, b) { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
-function vdot(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-function vnorm(v) { const l = vlen(v) || 1; return { x: v.x / l, y: v.y / l, z: v.z / l }; }
-function vscale(v, s) { return { x: v.x * s, y: v.y * s, z: v.z * s }; }
-function vadd(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
-function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
-function r2(n) { return Math.round(n * 100) / 100; }
-function r3(n) { return Math.round(n * 1000) / 1000; }
-
-/** Returns an outward push normal if pos is inside an island ellipsoid, else null. */
-function islandCollision(pos, islands) {
-  for (const isl of islands) {
-    const dx = (pos.x - isl.cx) / isl.rx;
-    const dy = (pos.y - isl.cy) / isl.ry;
-    const dz = (pos.z - isl.cz) / isl.rx;
-    const q = dx * dx + dy * dy + dz * dz;
-    if (q < 1) {
-      const n = vnorm({ x: dx / isl.rx, y: dy / isl.ry, z: dz / isl.rx });
-      const push = (1 - Math.sqrt(q)) * Math.min(isl.rx, isl.ry) + 2;
-      return { n, push, island: isl };
-    }
-  }
-  return null;
-}
 
 // ---------------------------------------------------------------------------
 const state = {
@@ -849,16 +780,7 @@ function endRound() {
     }));
   if (isRace) {
     // Finish order first, then gates passed, then fewest seconds for tied finishers
-    results.sort((a, b) => {
-      const fa = a.race.finished ? 0 : 1, fb = b.race.finished ? 0 : 1;
-      if (fa !== fb) return fa - fb;
-      if (a.race.finished && b.race.finished) {
-        if (a.race.finishRank !== b.race.finishRank) return a.race.finishRank - b.race.finishRank;
-        return a.race.finishTime - b.race.finishTime;
-      }
-      if (b.race.gatesPassed !== a.race.gatesPassed) return b.race.gatesPassed - a.race.gatesPassed;
-      return b.score - a.score;
-    });
+    results.sort(compareRaceResults);
   } else {
     results.sort((a, b) => b.score - a.score);
   }
@@ -1076,7 +998,7 @@ function findHomingTarget(r, t) {
     const to = vsub(pos, r.p);
     const d = vlen(to);
     if (d > range || d < 0.01) return;
-    const ang = Math.acos(clamp(vdot(r.d, vscale(to, 1 / d)), -1, 1));
+    const ang = homingAngle(r.d, r.p, pos);
     if (ang < bestAng) { bestAng = ang; best = { id, kind }; }
   };
   for (const p of state.players.values()) {
@@ -1286,14 +1208,9 @@ function raceGateFor(p) {
 function stepRaceGate(p, t) {
   const a = raceGateFor(p);
   if (!a) return;
-  const rel = { x: p.pos.x - a.x, y: p.pos.y - a.y, z: p.pos.z - a.z };
-  const nx = Math.sin(a.yaw), nz = Math.cos(a.yaw);
-  const along = rel.x * nx + rel.z * nz;
-  const lateral = Math.hypot(rel.x * nz - rel.z * nx, rel.y);
-  const side = along >= 0 ? 1 : -1;
-  const prev = p.gateSide[a.id];
-  p.gateSide[a.id] = side;
-  if (prev === undefined || prev === side || Math.abs(along) >= 30 || lateral >= a.gateR + 1.5) return;
+  const cross = gateCrossing(a, p.pos, p.gateSide[a.id]);
+  p.gateSide[a.id] = cross.side;
+  if (!cross.crossed) return;
   if (p.gateCooldown[a.id] > t) return;
   p.gateCooldown[a.id] = t + 3;
   p.race.gatesPassed++;
@@ -1306,7 +1223,7 @@ function stepRaceGate(p, t) {
     p.race.finished = true;
     p.race.finishRank = ++state.race.finishCount;
     p.race.finishTime = r2(Math.max(0, ROUND_SECONDS - Math.max(0, (state.roundEndsAt - Date.now()) / 1000)));
-    const pts = Math.max(RACE_FINISH_MIN, RACE_FINISH_BASE - RACE_FINISH_STEP * (p.race.finishRank - 1));
+    const pts = raceFinishPoints(p.race.finishRank);
     addScore(p, pts, t);
     io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)], race: true, gi: total, total });
     io.emit('finish', { id: p.id, rank: p.race.finishRank, points: pts, time: p.race.finishTime, p: [r2(a.x), r2(a.y), r2(a.z)] });

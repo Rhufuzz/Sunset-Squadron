@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && for f in public/js/*.js; do node --check \"$f\"; done"
+    "check": "node --check server.js && for f in public/js/*.js; do node --check \"$f\"; done",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"
