@@ -1,3 +1,7 @@
 node_modules/
 screenshots/*.png
 .tmp/
+data/leaderboard.json
+data/*.tmp
+data/*.corrupt-*
+.abacus.donotdelete

@@ -17,6 +17,9 @@ const path = require('path');
 const express = require('express');
 const { Server } = require('socket.io');
 const QRCode = require('qrcode');
+const PILOT_DATA = require('./shared/pilots');
+const { Leaderboard } = require('./leaderboard');
+const { PILOTS, POWERUPS, POWERUP_TYPES, PILOT_IDS, pilotById, perkMultipliers } = PILOT_DATA;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -48,9 +51,15 @@ const SUPER_TIME = 8.0;
 const RIBBON_POINTS = 44;            // ~2.2 seconds of ribbon at 20Hz
 const RIBBON_MIN_AGE = 0.5;          // seconds before a ribbon segment can be stolen through
 const BALLOON_RESPAWN_S = 18;
+const PICKUP_COUNT = 12;             // floating power-up orbs in the world at once
+const PICKUP_RESPAWN_S = 20;
+const PICKUP_RADIUS = 11;            // base collection radius
+const TURBO_SPEED = 95;
+const ROCKET_COOLDOWN_RAPID = 0.4;
+const MAGNET_MULT = 2.2;             // Magnet power-up range multiplier
 
-const CALLSIGNS = ['Renji', 'Resa', 'Kaya', 'Viper', 'Falcon', 'Nova', 'Blaze', 'Maverick', 'Comet', 'Echo', 'Bolt'];
 const BOT_NAMES = ['Wingman Ace', 'Wingman Duke', 'Wingman Pip', 'Wingman Zed'];
+const leaderboard = new Leaderboard();
 const PRESETS = ['sunset', 'noon', 'twilight'];
 const MODES = ['crown', 'blitz'];
 
@@ -210,6 +219,7 @@ const state = {
   rocketSeq: 1,
   crown: { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] },
   balloons: [],
+  pickups: [],
   roundEndsAt: 0,
   endedAt: 0,
   lastResults: null,
@@ -218,9 +228,12 @@ state.layout = generateLayout(state.seed);
 
 function now() { return Date.now() / 1000; }
 
-function makePlayer(id, name, color, isBot) {
+function makePlayer(id, name, pilot, isBot) {
   return {
-    id, name, color, isBot,
+    id, name, pilot, isBot,
+    perk: perkMultipliers(pilot),
+    fx: {},                       // active power-ups: type -> expiry time (seconds)
+    stats: { balloons: 0, hits: 0, crownTime: 0, pickups: 0 },
     pos: { x: 0, y: 80, z: 0 },
     quat: { x: 0, y: 0, z: 0, w: 1 },
     yaw: 0, pitch: 0, roll: 0,
@@ -262,6 +275,94 @@ function spawnPlayer(p, index, total) {
   p.gateSide = {};
   p.gateCooldown = {};
   p.stamina = 1;
+  p.fx = {};
+  p.stats = { balloons: 0, hits: 0, crownTime: 0, pickups: 0 };
+}
+
+/** Is a power-up currently active on this player? */
+function hasFx(p, type, t) { return p.fx[type] !== undefined && p.fx[type] > t; }
+function grantFx(p, type, t) {
+  const base = POWERUPS[type].duration * p.perk.fxDuration;
+  p.fx[type] = Math.max(p.fx[type] || 0, t) + base;
+  return base;
+}
+/** Score helper so Score x2 applies everywhere points are earned. */
+function addScore(p, amount, t) {
+  p.score += hasFx(p, 'x2', t) ? amount * 2 : amount;
+}
+function publicPlayer(p) {
+  return { id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, score: Math.round(p.score) };
+}
+
+// ---------------------------------------------------------------------------
+// Power-up pickups
+// ---------------------------------------------------------------------------
+function randomPickupPos(rand) {
+  const p = randomBalloonPos(rand, state.layout.islands);
+  // Keep them away from other pickups so they spread across the map
+  for (let tries = 0; tries < 8; tries++) {
+    let ok = true;
+    for (const o of state.pickups) if (o.alive && Math.hypot(o.x - p.x, o.z - p.z) < 90) { ok = false; break; }
+    if (ok) break;
+    const q = randomBalloonPos(rand, state.layout.islands);
+    p.x = q.x; p.y = q.y; p.z = q.z;
+  }
+  p.y = clamp(p.y, 35, 150);
+  return p;
+}
+function spawnPickups() {
+  state.pickups = [];
+  for (let i = 0; i < PICKUP_COUNT; i++) {
+    const type = POWERUP_TYPES[i % POWERUP_TYPES.length];
+    const pos = randomPickupPos(Math.random);
+    state.pickups.push({ id: i, type, x: pos.x, y: pos.y, z: pos.z, alive: true, respawnAt: 0 });
+  }
+}
+function pickupPublic(k) { return { id: k.id, type: k.type, x: r2(k.x), y: r2(k.y), z: r2(k.z), alive: k.alive }; }
+
+function collectPickup(k, p, t) {
+  k.alive = false;
+  k.respawnAt = t + PICKUP_RESPAWN_S;
+  const dur = grantFx(p, k.type, t);
+  p.stats.pickups++;
+  if (k.type === 'ghost') {
+    // Rockets already homing in lose their lock
+    for (const r of state.rockets) if (r.target === p.id && r.targetKind === 'player') r.target = null;
+  }
+  io.emit('pickup', { id: k.id, type: k.type, by: p.id, p: [r2(k.x), r2(k.y), r2(k.z)], dur: r2(dur) });
+}
+
+function stepPickups(t) {
+  for (const k of state.pickups) {
+    if (k.alive) continue;
+    if (t >= k.respawnAt) {
+      const pos = randomPickupPos(Math.random);
+      // Cycle the type so every orb type keeps appearing
+      k.type = POWERUP_TYPES[(POWERUP_TYPES.indexOf(k.type) + 1 + Math.floor(Math.random() * 2)) % POWERUP_TYPES.length];
+      k.x = pos.x; k.y = pos.y; k.z = pos.z;
+      k.alive = true;
+      io.emit('pickupSpawn', pickupPublic(k));
+    }
+  }
+  // Expire finished effects
+  for (const p of state.players.values()) {
+    for (const type of Object.keys(p.fx)) {
+      if (p.fx[type] <= t) {
+        delete p.fx[type];
+        io.emit('fxEnd', { id: p.id, type });
+      }
+    }
+  }
+}
+
+/** Effective collection radius for pickups/balloons/crown (perk + Magnet power-up). */
+function reach(p, base, t) {
+  return base * p.perk.magnet * (hasFx(p, 'magnet', t) ? MAGNET_MULT : 1);
+}
+function fxSnapshot(p, t) {
+  const out = {};
+  for (const type of Object.keys(p.fx)) if (p.fx[type] > t) out[type] = r2(p.fx[type] - t);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +481,19 @@ app.get('/api/host-info', async (req, res) => {
   }
 });
 
+app.get('/js/pilots-data.js', (req, res) => {
+  res.type('application/javascript').set('Cache-Control', 'no-cache').send(PILOT_DATA.toEsModuleSource());
+});
+
+app.get('/api/leaderboard', (req, res) => {
+  const n = clamp(parseInt(req.query.limit, 10) || 10, 1, 100);
+  res.set('Cache-Control', 'no-store').json(leaderboard.summary(n));
+});
+
+app.get('/api/pilots', (req, res) => {
+  res.json({ pilots: PILOTS, perks: PILOT_DATA.PERKS, powerups: POWERUPS });
+});
+
 app.get('/api/status', (req, res) => {
   res.json({
     phase: state.phase,
@@ -400,9 +514,10 @@ function lobbyPayload() {
     hostId: state.hostId,
     settings: state.settings,
     seed: state.seed,
-    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, color: p.color, isBot: p.isBot, score: p.score })),
+    players: [...state.players.values()].map(publicPlayer),
     timeRemaining: state.phase === 'playing' ? Math.max(0, (state.roundEndsAt - Date.now()) / 1000) : 0,
     lastResults: state.lastResults,
+    leaderboard: leaderboard.summary(10),
   };
 }
 function broadcastLobby() { io.emit('lobby', lobbyPayload()); }
@@ -422,7 +537,8 @@ function roundStartPayload() {
     serverNow: Date.now(),
     balloons: state.balloons.map((b) => ({ id: b.id, x: r2(b.x), y: r2(b.y), z: r2(b.z), alive: b.alive, tint: b.tint })),
     crown: { holderId: state.crown.holderId, pos: state.crown.pos },
-    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, color: p.color, isBot: p.isBot, pos: p.pos, yaw: p.yaw })),
+    pickups: state.pickups.map(pickupPublic),
+    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, pos: p.pos, yaw: p.yaw })),
   };
 }
 
@@ -433,10 +549,15 @@ function startRound() {
   state.layout = generateLayout(state.seed);
   // Remove previous bots, add new ones
   for (const b of bots()) state.players.delete(b.id);
+  // Bots get random pilots, preferring ones no human picked so the sky stays colourful
+  const takenPilots = new Set(humans().map((h) => h.pilot));
+  let pool = PILOT_IDS.filter((id) => !takenPilots.has(id));
   for (let i = 0; i < state.settings.bots; i++) {
+    if (!pool.length) pool = [...PILOT_IDS];
+    const pilot = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
     const id = `bot-${i + 1}`;
-    const b = makePlayer(id, BOT_NAMES[i % BOT_NAMES.length], (i * 3 + 5) % 8, true);
-    b.bot = { targetId: null, fleeUntil: 0, retarget: 0, wander: 0, boostUntil: 0 };
+    const b = makePlayer(id, BOT_NAMES[i % BOT_NAMES.length], pilot, true);
+    b.bot = { targetId: null, fleeUntil: 0, retarget: 0, wander: 0, boostUntil: 0, pickupId: null };
     state.players.set(id, b);
   }
   const all = [...state.players.values()];
@@ -444,6 +565,7 @@ function startRound() {
   state.rockets = [];
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
   state.balloons = state.layout.balloons.map((b) => ({ id: b.id, x: b.x, y: b.y, z: b.z, tint: b.tint, alive: true, respawnAt: 0 }));
+  spawnPickups();
   state.phase = 'playing';
   state.roundEndsAt = Date.now() + ROUND_SECONDS * 1000;
   state.lastResults = null;
@@ -456,10 +578,27 @@ function endRound() {
   if (state.phase !== 'playing') return;
   state.phase = 'ended';
   state.endedAt = Date.now();
+  const mode = state.settings.mode;
   const results = [...state.players.values()]
-    .map((p) => ({ id: p.id, name: p.name, color: p.color, isBot: p.isBot, score: Math.round(p.score) }))
+    .map((p) => ({
+      id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, score: Math.round(p.score),
+      stats: { balloons: p.stats.balloons, hits: p.stats.hits, crownTime: Math.round(p.stats.crownTime), pickups: p.stats.pickups },
+      newBests: [],
+    }))
     .sort((a, b) => b.score - a.score);
-  state.lastResults = { mode: state.settings.mode, results, endedAt: state.endedAt };
+  const winnerId = results.length ? results[0].id : null;
+  // Humans only on the persistent leaderboard
+  const humanRows = results.filter((r) => !r.isBot).map((r) => ({
+    name: r.name, pilot: r.pilot, score: r.score, won: r.id === winnerId,
+    points: mode === 'crown' ? r.stats.crownTime : r.score,
+    balloons: r.stats.balloons, hits: r.stats.hits,
+  }));
+  const bests = leaderboard.recordRound(mode, humanRows);
+  for (const r of results) {
+    if (r.isBot) continue;
+    r.newBests = bests[Leaderboard.key(r.name, r.pilot)] || [];
+  }
+  state.lastResults = { mode, results, endedAt: state.endedAt, winnerId, leaderboard: leaderboard.summary(10) };
   io.emit('roundEnd', state.lastResults);
   console.log('[round] ended:', results.map((r) => `${r.name}=${r.score}`).join(', '));
 }
@@ -468,6 +607,7 @@ function returnToLobby() {
   state.phase = 'lobby';
   for (const b of bots()) state.players.delete(b.id);
   state.rockets = [];
+  state.pickups = [];
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
   broadcastLobby();
 }
@@ -482,14 +622,16 @@ io.on('connection', (socket) => {
       return;
     }
     const safe = data && typeof data === 'object' ? data : {};
+    // Pilot characters: duplicates are allowed (two friends can both fly as KAYA);
+    // the player name keeps everyone distinguishable.
+    const pilot = PILOT_IDS.includes(safe.pilot) ? safe.pilot : PILOT_IDS[Math.floor(Math.random() * PILOT_IDS.length)];
     let name = String(safe.name || '').slice(0, 14).replace(/[^\w\- ]/g, '').trim();
-    if (!name) name = CALLSIGNS[Math.floor(Math.random() * CALLSIGNS.length)];
-    // Keep callsigns unique
+    if (!name) name = pilotById(pilot).callsign;
+    // Keep player names unique within the squadron
     const taken = new Set([...state.players.values()].map((p) => p.name));
     let unique = name; let n = 2;
     while (taken.has(unique)) unique = `${name} ${n++}`;
-    const color = clamp(parseInt(safe.color, 10) || 0, 0, 7);
-    player = makePlayer(socket.id, unique, color, false);
+    player = makePlayer(socket.id, unique, pilot, false);
     state.players.set(socket.id, player);
     state.joinOrder.push(socket.id);
     pickHost();
@@ -500,7 +642,15 @@ io.on('connection', (socket) => {
     }
     if (typeof ack === 'function') ack({ ok: true, id: socket.id, lobby: lobbyPayload() });
     broadcastLobby();
-    console.log(`[join] ${unique} (${socket.id}) host=${state.hostId === socket.id}`);
+    console.log(`[join] ${unique} as ${pilot} (${socket.id}) host=${state.hostId === socket.id}`);
+  });
+
+  socket.on('setPilot', (data) => {
+    // Pilot can be changed from the lobby roster between rounds
+    if (!player || state.phase === 'playing' || !data || !PILOT_IDS.includes(data.pilot)) return;
+    player.pilot = data.pilot;
+    player.perk = perkMultipliers(data.pilot);
+    broadcastLobby();
   });
 
   socket.on('setSettings', (data) => {
@@ -556,7 +706,7 @@ io.on('connection', (socket) => {
     if (!player || state.phase !== 'playing') return;
     const t = now();
     if (t < player.rollingUntil) return;
-    player.rollingUntil = t + BARREL_ROLL_TIME;
+    player.rollingUntil = t + BARREL_ROLL_TIME * player.perk.rollTime;
     io.emit('roll', { id: player.id });
   });
 
@@ -583,7 +733,9 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 function tryFire(p) {
   const t = now();
-  const cd = t < p.superUntil ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
+  let cd = t < p.superUntil ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
+  if (hasFx(p, 'rapid', t)) cd = Math.min(cd, ROCKET_COOLDOWN_RAPID);
+  cd *= p.perk.reload;
   if (t - p.lastFire < cd - 0.05) return false;
   p.lastFire = t;
   const dir = forwardFromYP(p.yaw, p.pitch);
@@ -612,18 +764,21 @@ function giveCrown(toId, how, fromId) {
   io.emit('crown', { holderId: toId, by: toId, from: fromId || null, how });
 }
 
-function findHomingTarget(r) {
+function findHomingTarget(r, t) {
   let best = null;
   let bestAng = HOMING_CONE;
+  const owner = state.players.get(r.owner);
+  const range = HOMING_RANGE * (owner ? owner.perk.homingRange : 1);
   const consider = (pos, id, kind) => {
     const to = vsub(pos, r.p);
     const d = vlen(to);
-    if (d > HOMING_RANGE || d < 0.01) return;
+    if (d > range || d < 0.01) return;
     const ang = Math.acos(clamp(vdot(r.d, vscale(to, 1 / d)), -1, 1));
     if (ang < bestAng) { bestAng = ang; best = { id, kind }; }
   };
   for (const p of state.players.values()) {
     if (p.id === r.owner) continue;
+    if (hasFx(p, 'ghost', t)) continue;   // Ghost: invisible to homing
     consider(p.pos, p.id, 'player');
   }
   if (state.settings.mode === 'blitz') {
@@ -637,7 +792,7 @@ function stepRockets(dt, t) {
   for (const r of state.rockets) {
     if (t - r.born > ROCKET_LIFE) continue;
     if (!r.target) {
-      const tg = findHomingTarget(r);
+      const tg = findHomingTarget(r, t);
       if (tg) { r.target = tg.id; r.targetKind = tg.kind; }
     }
     if (r.target) {
@@ -676,13 +831,20 @@ function stepRockets(dt, t) {
       if (d < 8 && t >= p.invulnUntil && !(t < p.rollingUntil)) {
         dead = true;
         const shooter = state.players.get(r.owner);
-        p.tumbleUntil = t + TUMBLE_TIME;
+        if (hasFx(p, 'shield', t)) {
+          // Shield Bubble absorbs the hit and pops
+          delete p.fx.shield;
+          io.emit('shieldBreak', { id: p.id, by: r.owner, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)] });
+          break;
+        }
+        p.tumbleUntil = t + TUMBLE_TIME * p.perk.tumble;
         let crownStolen = false;
+        if (shooter) shooter.stats.hits++;
         if (state.settings.mode === 'crown' && state.crown.holderId === p.id && shooter) {
           crownStolen = true;
           giveCrown(shooter.id, 'rocket', p.id);
         } else if (state.settings.mode === 'blitz' && shooter) {
-          shooter.score += 5;
+          addScore(shooter, 5, t);
         }
         io.emit('hit', { shooter: r.owner, victim: p.id, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], crownStolen });
         break;
@@ -711,7 +873,7 @@ function popBalloon(b, byId, t) {
   b.alive = false;
   b.respawnAt = t + BALLOON_RESPAWN_S;
   const p = state.players.get(byId);
-  if (p) p.score += 10;
+  if (p) { addScore(p, 10, t); p.stats.balloons++; }
   io.emit('pop', { id: b.id, by: byId, p: [r2(b.x), r2(b.y), r2(b.z)], tint: b.tint });
 }
 
@@ -730,10 +892,16 @@ function stepBalloons(t) {
 function stepGatesAndPickups(t) {
   const mode = state.settings.mode;
   for (const p of state.players.values()) {
+    // Power-up orbs (both modes)
+    const pickR = reach(p, PICKUP_RADIUS, t);
+    for (const k of state.pickups) {
+      if (k.alive && dist(k, p.pos) < pickR) collectPickup(k, p, t);
+    }
     if (mode === 'blitz') {
       // Balloons popped by flying straight into them
+      const balloonR = reach(p, 9, t);
       for (const b of state.balloons) {
-        if (b.alive && dist(b, p.pos) < 9) popBalloon(b, p.id, t);
+        if (b.alive && dist(b, p.pos) < balloonR) popBalloon(b, p.id, t);
       }
       // Ring gates: detect crossing the gate plane inside the ring radius
       for (const a of state.layout.arches) {
@@ -747,7 +915,7 @@ function stepGatesAndPickups(t) {
         if (prev !== undefined && prev !== side && Math.abs(along) < 30 && lateral < a.gateR + 1.5) {
           if (!(p.gateCooldown[a.id] > t)) {
             p.gateCooldown[a.id] = t + 3;
-            p.score += 25;
+            addScore(p, 25, t);
             p.superUntil = t + SUPER_TIME;
             io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)] });
           }
@@ -758,11 +926,12 @@ function stepGatesAndPickups(t) {
       // Crown mode: pick up a loose crown, or steal through the holder's ribbon contrail
       const c = state.crown;
       if (!c.holderId) {
-        if (dist(c.pos, p.pos) < 12) giveCrown(p.id, 'pickup', null);
+        if (dist(c.pos, p.pos) < reach(p, 12, t)) giveCrown(p.id, 'pickup', null);
       } else if (c.holderId !== p.id && t >= (state.players.get(c.holderId) || {}).invulnUntil) {
+        const ribbonR = reach(p, 7, t);
         for (const seg of c.ribbon) {
           if (t - seg.t < RIBBON_MIN_AGE) continue;
-          if (Math.hypot(seg.x - p.pos.x, seg.y - p.pos.y, seg.z - p.pos.z) < 7) {
+          if (Math.hypot(seg.x - p.pos.x, seg.y - p.pos.y, seg.z - p.pos.z) < ribbonR) {
             const prevHolder = c.holderId;
             const victim = state.players.get(prevHolder);
             if (victim) victim.tumbleUntil = t + TUMBLE_TIME * 0.5;
@@ -782,7 +951,8 @@ function stepCrown(dt, t) {
     const h = state.players.get(c.holderId);
     if (!h) { dropCrown(c.pos); return; }
     c.pos = { x: h.pos.x, y: h.pos.y + 5, z: h.pos.z };
-    h.score += dt;
+    addScore(h, dt, t);
+    h.stats.crownTime += dt;
     // Ribbon contrail trails behind the holder
     const back = forwardFromYP(h.yaw, h.pitch);
     c.ribbon.push({ x: h.pos.x - back.x * 4, y: h.pos.y - back.y * 4 + 0.5, z: h.pos.z - back.z * 4, t });
@@ -808,6 +978,15 @@ function stepBot(p, dt, t) {
   if (t > bs.retarget) {
     bs.retarget = t + 0.6 + Math.random() * 0.8;
     bs.targetId = null;
+    bs.pickupId = null;
+    // Grab a nearby power-up first if there is one worth having
+    let bestK = null, bestKD = 220;
+    for (const k of state.pickups) {
+      if (!k.alive || hasFx(p, k.type, t)) continue;
+      const d = dist(k, p.pos);
+      if (d < bestKD) { bestKD = d; bestK = k; }
+    }
+    if (bestK && Math.random() < 0.7) bs.pickupId = bestK.id;
     if (mode === 'crown') {
       const c = state.crown;
       if (c.holderId === p.id) {
@@ -840,7 +1019,11 @@ function stepBot(p, dt, t) {
     }
   }
 
-  if (mode === 'crown') {
+  const wantedPickup = bs.pickupId !== null ? state.pickups[bs.pickupId] : null;
+  if (wantedPickup && wantedPickup.alive) {
+    goal = { x: wantedPickup.x, y: wantedPickup.y, z: wantedPickup.z };
+    wantBoost = hasFx(p, 'turbo', t);
+  } else if (mode === 'crown') {
     if (bs.targetId === 'flee') {
       // Run away from the nearest pursuer, weaving around the archipelago
       let nearest = null, nd = Infinity;
@@ -924,7 +1107,7 @@ function stepBot(p, dt, t) {
   if (t >= p.rollingUntil) {
     for (const r of state.rockets) {
       if (r.target === p.id && r.targetKind === 'player' && dist(r.p, p.pos) < 45 && Math.random() < 0.08) {
-        p.rollingUntil = t + BARREL_ROLL_TIME;
+        p.rollingUntil = t + BARREL_ROLL_TIME * p.perk.rollTime;
         io.emit('roll', { id: p.id });
         break;
       }
@@ -936,12 +1119,14 @@ function stepBot(p, dt, t) {
 function stepFlight(p, joyX, joyY, boost, dt, t) {
   const sup = t < p.superUntil;
   const burst = t < p.burstUntil;
-  if (boost && p.stamina > 0.02) p.stamina = Math.max(0, p.stamina - dt * 0.45);
-  else { boost = false; p.stamina = Math.min(1, p.stamina + dt * 0.28); }
+  const turbo = hasFx(p, 'turbo', t);
+  if (turbo) { boost = true; p.stamina = Math.min(1, p.stamina + dt * 0.28 * p.perk.stamRegen); }
+  else if (boost && p.stamina > 0.02) p.stamina = Math.max(0, p.stamina - dt * 0.45);
+  else { boost = false; p.stamina = Math.min(1, p.stamina + dt * 0.28 * p.perk.stamRegen); }
   p.boost = boost;
-  const target = sup ? SPEED_SUPER : (boost || burst) ? SPEED_BOOST : SPEED_BASE;
+  const target = sup ? SPEED_SUPER : turbo ? TURBO_SPEED : (boost || burst) ? SPEED_BOOST : SPEED_BASE;
   p.speed = lerp(p.speed, target, Math.min(1, dt * 3));
-  p.yaw += -joyX * 2.1 * dt;
+  p.yaw += -joyX * 2.1 * p.perk.turn * dt;
   p.yaw = wrapAngle(p.yaw);
   p.pitch = lerp(p.pitch, -joyY * 0.75, Math.min(1, dt * 6));
   p.roll = lerp(p.roll, -joyX * 1.05, Math.min(1, dt * 8));
@@ -992,7 +1177,9 @@ function snapshot(t) {
       tu: t < p.tumbleUntil ? r2(p.tumbleUntil - t) : 0,
       rl: t < p.rollingUntil ? r2(p.rollingUntil - t) : 0,
       st: r2(p.stamina),
+      fx: fxSnapshot(p, t),
     })),
+    pickups: state.pickups.map((k) => (k.alive ? 1 : 0)),
     rockets: state.rockets.map((r) => ({ id: r.id, o: r.owner, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], d: [r3(r.d.x), r3(r.d.y), r3(r.d.z)] })),
     balloons: state.settings.mode === 'blitz' ? state.balloons.map((b) => (b.alive ? 1 : 0)) : [],
   };
@@ -1008,6 +1195,7 @@ function tick() {
     stepCrown(dt, t);
     stepGatesAndPickups(t);
     stepBalloons(t);
+    stepPickups(t);
     io.emit('snap', snapshot(t));
     if (Date.now() >= state.roundEndsAt) endRound();
   } else if (state.phase === 'ended') {
@@ -1027,6 +1215,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  LAN:     http://${lan}:${PORT}`);
   if (PUBLIC_URL) console.log(`  Public:  ${PUBLIC_URL}`);
   console.log(`  Seed:    ${state.seed}`);
+  console.log(`  Board:   ${leaderboard.file}`);
   console.log('  Scan the QR code in the lobby to join from an iPad.');
   console.log('========================================================');
 });

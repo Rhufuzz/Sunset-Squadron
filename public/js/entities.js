@@ -1,6 +1,7 @@
 // entities.js - procedural low-poly jets, the Golden Crown, hot-air balloons,
 // firework rockets and the golden ribbon contrail. Zero asset files.
 import * as THREE from 'three';
+import { POWERUPS } from './pilots-data.js';
 
 export const PAINT_COLORS = [
   { name: 'Coral', hex: 0xff5e5b },
@@ -33,12 +34,22 @@ function geo(key, build) {
 // Jet
 // ---------------------------------------------------------------------------
 export class Jet {
-  constructor(colorIndex, name) {
+  /**
+   * @param {object} pilot  pilot definition from pilots-data.js (colors.body/wing/trail/accent)
+   * @param {string} name   player name shown on the floating tag
+   * @param {HTMLCanvasElement|null} portrait  optional portrait drawn next to the name
+   */
+  constructor(pilot, name, portrait = null) {
     this.group = new THREE.Group();
     this.name = name;
-    this.colorIndex = colorIndex;
-    const paint = paintHex(colorIndex);
+    this.pilot = pilot;
+    this.portrait = portrait;
+    const paint = pilot.colors.body;
+    const wingPaint = pilot.colors.wing;
+    const trail = pilot.colors.trail;
+    this.trailCss = '#' + trail.toString(16).padStart(6, '0');
     this.bodyMat = new THREE.MeshStandardMaterial({ color: paint, flatShading: true, roughness: 0.55, metalness: 0.15 });
+    this.wingMat = new THREE.MeshStandardMaterial({ color: wingPaint, flatShading: true, roughness: 0.55, metalness: 0.15 });
     const darkMat = new THREE.MeshStandardMaterial({ color: 0x2a2438, flatShading: true, roughness: 0.6, metalness: 0.2 });
     const canopyMat = new THREE.MeshStandardMaterial({ color: 0x7fe9ff, emissive: 0x2a9ab8, emissiveIntensity: 0.35, flatShading: true, roughness: 0.2, metalness: 0.4 });
     this.burnerMat = new THREE.MeshStandardMaterial({ color: 0xffb060, emissive: 0xff9a2a, emissiveIntensity: 2.8, roughness: 0.4, flatShading: true });
@@ -77,7 +88,7 @@ export class Jet {
       g.rotateX(Math.PI / 2);
       g.translate(0, -0.2, 0);
       return g;
-    }), this.bodyMat);
+    }), this.wingMat);
     // Tail fins
     const vfin = new THREE.Mesh(geo('vfin', () => {
       const shape = new THREE.Shape();
@@ -119,8 +130,8 @@ export class Jet {
       return g;
     }), this.burnerMat);
     this.burner.position.z = 5.6;
-    // Wing-tip lights
-    const tipMat = new THREE.MeshStandardMaterial({ color: paint, emissive: paint, emissiveIntensity: 1.8 });
+    // Wing-tip lights glow in the pilot's trail colour
+    const tipMat = new THREE.MeshStandardMaterial({ color: trail, emissive: trail, emissiveIntensity: 1.8 });
     const tipL = new THREE.Mesh(geo('tip', () => new THREE.SphereGeometry(0.28, 6, 4)), tipMat);
     const tipR = tipL.clone();
     tipL.position.set(-6.1, 0, 2.9);
@@ -131,6 +142,48 @@ export class Jet {
     this.body = new THREE.Group();
     this.body.add(...parts);
     this.group.add(this.body);
+    this.opaqueMats = [this.bodyMat, this.wingMat, darkMat, canopyMat, this.burnerMat, tipMat];
+    this.ghosted = false;
+
+    // ----- power-up visuals -----
+    // Shield Bubble: cyan translucent sphere with a wireframe cage
+    this.bubble = new THREE.Group();
+    this.bubbleMat = new THREE.MeshStandardMaterial({ color: 0x4ff1ff, emissive: 0x4ff1ff, emissiveIntensity: 0.9, transparent: true, opacity: 0.16, depthWrite: false, side: THREE.DoubleSide });
+    this.bubble.add(new THREE.Mesh(geo('bubble', () => new THREE.SphereGeometry(8.5, 14, 10)), this.bubbleMat));
+    this.bubble.add(new THREE.Mesh(geo('bubbleCage', () => new THREE.IcosahedronGeometry(8.7, 1)), new THREE.MeshBasicMaterial({ color: 0x9ffbff, wireframe: true, transparent: true, opacity: 0.35, depthWrite: false })));
+    this.bubble.visible = false;
+    this.group.add(this.bubble);
+    // Turbo Booster: twin flame cones behind the wings
+    this.turboMat = new THREE.MeshStandardMaterial({ color: 0xffc070, emissive: 0xff7a1a, emissiveIntensity: 3.2, transparent: true, opacity: 0.9, flatShading: true });
+    this.turboFlames = new THREE.Group();
+    for (const sx of [-3.2, 3.2]) {
+      const f = new THREE.Mesh(geo('turboFlame', () => { const g = new THREE.ConeGeometry(0.55, 4.5, 5); g.rotateX(Math.PI / 2); return g; }), this.turboMat);
+      f.position.set(sx, 0, 5.4);
+      this.turboFlames.add(f);
+    }
+    this.turboFlames.visible = false;
+    this.group.add(this.turboFlames);
+    // Rapid Fire: red twin barrel glow under the nose
+    this.rapidMat = new THREE.MeshStandardMaterial({ color: 0xff5e5b, emissive: 0xff5e5b, emissiveIntensity: 3.0 });
+    this.rapidPods = new THREE.Group();
+    for (const sx of [-1.1, 1.1]) {
+      const pod = new THREE.Mesh(geo('rapidPod', () => { const g = new THREE.CylinderGeometry(0.22, 0.22, 2.2, 6); g.rotateX(Math.PI / 2); return g; }), this.rapidMat);
+      pod.position.set(sx, -0.6, -3.2);
+      this.rapidPods.add(pod);
+    }
+    this.rapidPods.visible = false;
+    this.group.add(this.rapidPods);
+    // Magnet: lime orbit ring around the jet
+    this.magnetRing = new THREE.Mesh(geo('magnetRing', () => new THREE.TorusGeometry(9, 0.16, 6, 40)), new THREE.MeshStandardMaterial({ color: 0xb6ff3c, emissive: 0xb6ff3c, emissiveIntensity: 2.6, transparent: true, opacity: 0.8 }));
+    this.magnetRing.visible = false;
+    this.group.add(this.magnetRing);
+    // Score x2: gold halo above the canopy
+    this.x2Halo = new THREE.Mesh(geo('x2Halo', () => new THREE.TorusGeometry(1.6, 0.18, 6, 16)), new THREE.MeshStandardMaterial({ color: 0xffd54a, emissive: 0xffd54a, emissiveIntensity: 3.0 }));
+    this.x2Halo.position.set(0, 2.6, -1.4);
+    this.x2Halo.rotation.x = Math.PI / 2;
+    this.x2Halo.visible = false;
+    this.group.add(this.x2Halo);
+    this.fxTimer = 0;
 
     // Shield shimmer shown while invulnerable after a crown steal
     this.shield = new THREE.Mesh(
@@ -149,26 +202,59 @@ export class Jet {
     this.superRing.visible = false;
     this.group.add(this.superRing);
 
-    // Name label (sprite from canvas)
-    this.label = makeLabel(name, paintCss(colorIndex));
-    this.label.position.y = 4.2;
+    // Name tag (sprite from canvas): portrait + player name + pilot callsign
+    this.label = makeLabel(name, this.trailCss, pilot.callsign, portrait);
+    this.label.position.y = 4.6;
     this.group.add(this.label);
 
     this.exhaustTimer = 0;
     this.tumbleSpin = 0;
+    this.trailColors = [new THREE.Color(0xfff2c0), new THREE.Color(trail), new THREE.Color(0x4a4458)];
   }
 
   setName(name) {
     this.group.remove(this.label);
-    this.label = makeLabel(name, paintCss(this.colorIndex));
-    this.label.position.y = 4.2;
+    this.name = name;
+    this.label = makeLabel(name, this.trailCss, this.pilot.callsign, this.portrait);
+    this.label.position.y = 4.6;
     this.group.add(this.label);
   }
 
-  /** Per-frame visual flourish: afterburner size, super ring, shield, tumble spin. */
+  /** Ghost power-up: fade every opaque material. */
+  _setGhost(on) {
+    if (on === this.ghosted) return;
+    this.ghosted = on;
+    for (const m of this.opaqueMats) {
+      m.transparent = on;
+      m.opacity = on ? 0.35 : 1;
+      m.needsUpdate = true;
+    }
+  }
+
+  /** Per-frame visual flourish: afterburner size, super ring, shield, power-ups, tumble spin. */
   updateVisual(dt, info, particles, time) {
+    const fx = info.fx || {};
     const boostAmt = info.boost ? 1 : 0;
     const superAmt = info.super ? 1 : 0;
+    // Power-up visuals
+    this.bubble.visible = Boolean(fx.shield);
+    if (this.bubble.visible) { this.bubble.rotation.y += dt * 0.8; this.bubble.rotation.z -= dt * 0.5; this.bubbleMat.opacity = 0.14 + Math.sin(time * 6) * 0.04; }
+    this.turboFlames.visible = Boolean(fx.turbo);
+    if (this.turboFlames.visible) { const k = 1 + Math.sin(time * 50) * 0.25; this.turboFlames.scale.set(1, 1, k); }
+    this.rapidPods.visible = Boolean(fx.rapid);
+    if (this.rapidPods.visible) this.rapidMat.emissiveIntensity = 2.4 + Math.sin(time * 30) * 1.2;
+    this.magnetRing.visible = Boolean(fx.magnet);
+    if (this.magnetRing.visible) { this.magnetRing.rotation.x = Math.sin(time * 2) * 0.6; this.magnetRing.rotation.y += dt * 3; }
+    this.x2Halo.visible = Boolean(fx.x2);
+    if (this.x2Halo.visible) this.x2Halo.rotation.z += dt * 4;
+    this._setGhost(Boolean(fx.ghost));
+    this.fxTimer -= dt;
+    if (particles && this.fxTimer <= 0 && (fx.turbo || fx.magnet || fx.x2)) {
+      this.fxTimer = 0.08;
+      const col = fx.turbo ? TURBO_COLORS : fx.magnet ? MAGNET_COLORS : GOLD_COLORS;
+      const off = new THREE.Vector3((Math.random() - 0.5) * 8, (Math.random() - 0.5) * 3, 2 + Math.random() * 5).applyQuaternion(this.group.quaternion).add(this.group.position);
+      particles.spawn({ pos: off, vel: { x: (Math.random() - 0.5) * 4, y: 1 + Math.random() * 2, z: (Math.random() - 0.5) * 4 }, life: 0.5, size: 0.5, drag: 1.5, colors: col, glow: 2.2 });
+    }
     const s = 0.8 + boostAmt * 0.6 + superAmt * 0.9 + Math.sin(time * 40) * 0.12;
     this.burner.scale.set(1 + boostAmt * 0.3 + superAmt * 0.4, 1 + boostAmt * 0.3 + superAmt * 0.4, s);
     this.burnerMat.emissiveIntensity = 2.6 + boostAmt * 1.0 + superAmt * 1.4;
@@ -196,15 +282,19 @@ export class Jet {
         life: info.super ? 0.9 : info.boost ? 0.7 : 0.5,
         size: info.boost || info.super ? 0.9 : 0.6,
         drag: 1.2,
-        colors: info.super ? SUPER_COLORS : EXHAUST_COLORS,
-        glow: info.boost || info.super ? 2.0 : 1.4,
+        colors: info.super ? SUPER_COLORS : (info.boost || fx.turbo) ? this.trailColors : EXHAUST_COLORS,
+        glow: info.boost || info.super || fx.turbo ? 2.0 : 1.4,
       });
     }
   }
 
   dispose() {
     this.bodyMat.dispose();
+    this.wingMat.dispose();
     this.burnerMat.dispose();
+    this.bubbleMat.dispose();
+    this.turboMat.dispose();
+    this.rapidMat.dispose();
     if (this.label.material.map) this.label.material.map.dispose();
     this.label.material.dispose();
   }
@@ -212,6 +302,14 @@ export class Jet {
 
 const EXHAUST_COLORS = [new THREE.Color(0xfff2c0), new THREE.Color(0xff8a2a), new THREE.Color(0x4a4458)];
 const SUPER_COLORS = [new THREE.Color(0xe0ffff), new THREE.Color(0x4ff1ff), new THREE.Color(0x2b3f6e)];
+const TURBO_COLORS = [new THREE.Color(0xfff2c0), new THREE.Color(0xff7a1a), new THREE.Color(0x6e2a1d)];
+const MAGNET_COLORS = [new THREE.Color(0xf4ffd0), new THREE.Color(0xb6ff3c), new THREE.Color(0x2d5a1d)];
+export const SHIELD_COLORS = [new THREE.Color(0xffffff), new THREE.Color(0x4ff1ff), new THREE.Color(0x1d3c6e)];
+/** Particle palette for each power-up type (pickup bursts). */
+export function powerupPalette(type) {
+  const c = new THREE.Color(POWERUPS[type] ? POWERUPS[type].color : 0xffffff);
+  return [new THREE.Color(0xffffff), c, c.clone().multiplyScalar(0.3)];
+}
 export const FIREWORK_PALETTES = [
   [new THREE.Color(0xffffff), new THREE.Color(0xff5e5b), new THREE.Color(0x6e1f3a)],
   [new THREE.Color(0xffffff), new THREE.Color(0x4ff0b0), new THREE.Color(0x1d5a4a)],
@@ -222,25 +320,45 @@ export const FIREWORK_PALETTES = [
 export const SPLASH_COLORS = [new THREE.Color(0xffffff), new THREE.Color(0x9fe8ff), new THREE.Color(0x0f5e78)];
 export const GOLD_COLORS = [new THREE.Color(0xfff6c0), new THREE.Color(0xffd54a), new THREE.Color(0x8a5a10)];
 
-function makeLabel(text, color) {
+function makeLabel(text, color, callsign = '', portrait = null) {
   const canvas = document.createElement('canvas');
-  canvas.width = 256;
-  canvas.height = 64;
+  canvas.width = 320;
+  canvas.height = 80;
   const ctx = canvas.getContext('2d');
-  ctx.font = 'bold 36px -apple-system, Segoe UI, system-ui, sans-serif';
-  ctx.textAlign = 'center';
+  const font = '-apple-system, Segoe UI, system-ui, sans-serif';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = 'rgba(20,14,40,0.55)';
-  const w = Math.min(240, ctx.measureText(text).width + 28);
-  roundRect(ctx, 128 - w / 2, 8, w, 48, 14);
+  ctx.font = `bold 34px ${font}`;
+  const nameW = ctx.measureText(text).width;
+  ctx.font = `bold 20px ${font}`;
+  const callW = callsign ? ctx.measureText(callsign).width : 0;
+  const textW = Math.max(nameW, callW);
+  const padL = portrait ? 76 : 16;
+  const w = Math.min(312, textW + padL + 16);
+  const x0 = 160 - w / 2;
+  ctx.fillStyle = 'rgba(20,14,40,0.6)';
+  roundRect(ctx, x0, 6, w, 68, 16);
   ctx.fill();
+  if (portrait) {
+    ctx.save();
+    roundRect(ctx, x0 + 8, 12, 56, 56, 12);
+    ctx.clip();
+    ctx.drawImage(portrait, x0 + 8, 12, 56, 56);
+    ctx.restore();
+  }
+  ctx.textAlign = 'left';
   ctx.fillStyle = color;
-  ctx.fillText(text, 128, 33);
+  ctx.font = `bold 34px ${font}`;
+  ctx.fillText(text, x0 + padL, callsign ? 30 : 40, w - padL - 12);
+  if (callsign) {
+    ctx.fillStyle = 'rgba(255,246,232,0.8)';
+    ctx.font = `bold 20px ${font}`;
+    ctx.fillText(callsign, x0 + padL, 58, w - padL - 12);
+  }
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
   const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(10, 2.5, 1);
+  sprite.scale.set(12, 3, 1);
   sprite.renderOrder = 5;
   return sprite;
 }
@@ -437,9 +555,9 @@ export class Balloon {
 // Firework rocket
 // ---------------------------------------------------------------------------
 export class Rocket {
-  constructor(colorIndex) {
+  /** @param {number} paint hex colour of the firing pilot's trail */
+  constructor(paint) {
     this.group = new THREE.Group();
-    const paint = paintHex(colorIndex);
     this.headMat = new THREE.MeshStandardMaterial({ color: paint, emissive: paint, emissiveIntensity: 3.6, flatShading: true });
     const head = new THREE.Mesh(geo('rocketHead', () => {
       const g = new THREE.ConeGeometry(0.9, 2.2, 6);
@@ -481,5 +599,117 @@ export class Rocket {
         life: 0.55, size: 1.0, drag: 1.0, colors: this.colors, glow: 1.8,
       });
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Power-up pickup orbs: glowing core + type-specific inner symbol + orbit ring.
+// ---------------------------------------------------------------------------
+export class Pickup {
+  constructor(type) {
+    this.type = type;
+    this.group = new THREE.Group();
+    const def = POWERUPS[type] || POWERUPS.turbo;
+    const col = def.color;
+    this.coreMat = new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 2.2, transparent: true, opacity: 0.55, flatShading: true, depthWrite: false });
+    this.symbolMat = new THREE.MeshStandardMaterial({ color: 0xfff6e8, emissive: col, emissiveIntensity: 3.2, flatShading: true });
+    this.ringMat = new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 2.6, transparent: true, opacity: 0.85 });
+    this.core = new THREE.Mesh(geo('pickupCore', () => new THREE.IcosahedronGeometry(4.2, 1)), this.coreMat);
+    this.group.add(this.core);
+    this.cage = new THREE.Mesh(geo('pickupCage', () => new THREE.IcosahedronGeometry(4.6, 0)), new THREE.MeshBasicMaterial({ color: col, wireframe: true, transparent: true, opacity: 0.6 }));
+    this.group.add(this.cage);
+    this.symbol = new THREE.Group();
+    switch (type) {
+      case 'turbo': {
+        const m = new THREE.Mesh(geo('pkTurbo', () => { const g = new THREE.ConeGeometry(1.3, 3.4, 4); g.rotateX(Math.PI / 2); return g; }), this.symbolMat);
+        const m2 = m.clone(); m2.position.z = 1.2; m2.scale.setScalar(0.65);
+        m.position.z = -1.2;
+        this.symbol.add(m, m2);
+        break;
+      }
+      case 'shield': {
+        const m = new THREE.Mesh(geo('pkShield', () => new THREE.OctahedronGeometry(2.1, 0)), this.symbolMat);
+        m.scale.set(1, 1.35, 0.45);
+        this.symbol.add(m);
+        break;
+      }
+      case 'rapid': {
+        for (let i = 0; i < 3; i++) {
+          const m = new THREE.Mesh(geo('pkRapid', () => { const g = new THREE.CylinderGeometry(0.4, 0.4, 3.2, 5); g.rotateX(Math.PI / 2); return g; }), this.symbolMat);
+          m.position.set((i - 1) * 1.3, 0, 0);
+          this.symbol.add(m);
+        }
+        break;
+      }
+      case 'magnet': {
+        const m = new THREE.Mesh(geo('pkMagnet', () => new THREE.TorusGeometry(1.7, 0.5, 6, 12, Math.PI)), this.symbolMat);
+        m.rotation.z = Math.PI;
+        const tipMat = new THREE.MeshStandardMaterial({ color: 0xff5e5b, emissive: 0xff5e5b, emissiveIntensity: 2.4, flatShading: true });
+        for (const sx of [-1.7, 1.7]) {
+          const tip = new THREE.Mesh(geo('pkMagnetTip', () => new THREE.BoxGeometry(1.0, 1.1, 1.0)), tipMat);
+          tip.position.set(sx, 0.9, 0);
+          this.symbol.add(tip);
+        }
+        this.symbol.add(m);
+        break;
+      }
+      case 'ghost': {
+        const m = new THREE.Mesh(geo('pkGhost', () => { const g = new THREE.SphereGeometry(1.9, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.62); return g; }), this.symbolMat);
+        m.position.y = 0.4;
+        this.symbol.add(m);
+        const skirt = new THREE.Mesh(geo('pkGhostSkirt', () => new THREE.ConeGeometry(1.9, 1.6, 8, 1, true)), this.symbolMat);
+        skirt.rotation.x = Math.PI;
+        skirt.position.y = -0.6;
+        this.symbol.add(skirt);
+        break;
+      }
+      default: {
+        // x2: a pair of spinning diamonds
+        for (const sx of [-1.3, 1.3]) {
+          const m = new THREE.Mesh(geo('pkX2', () => new THREE.OctahedronGeometry(1.3, 0)), this.symbolMat);
+          m.position.x = sx;
+          this.symbol.add(m);
+        }
+      }
+    }
+    this.group.add(this.symbol);
+    this.ring = new THREE.Mesh(geo('pickupRing', () => new THREE.TorusGeometry(6.2, 0.22, 6, 30)), this.ringMat);
+    this.ring.rotation.x = Math.PI / 2;
+    this.group.add(this.ring);
+    this.baseY = 0;
+    this.phase = Math.random() * Math.PI * 2;
+    this.sparkTimer = 0;
+  }
+
+  setPosition(x, y, z) {
+    this.baseY = y;
+    this.group.position.set(x, y, z);
+  }
+
+  update(dt, time, particles) {
+    this.group.position.y = this.baseY + Math.sin(time * 1.4 + this.phase) * 1.8;
+    this.symbol.rotation.y += dt * 2.2;
+    this.cage.rotation.y -= dt * 0.7;
+    this.cage.rotation.x += dt * 0.4;
+    this.ring.rotation.z += dt * 1.5;
+    this.ring.rotation.x = Math.PI / 2 + Math.sin(time * 1.1 + this.phase) * 0.35;
+    const pulse = 1 + Math.sin(time * 4 + this.phase) * 0.08;
+    this.core.scale.setScalar(pulse);
+    this.coreMat.emissiveIntensity = 1.9 + Math.sin(time * 4 + this.phase) * 0.5;
+    this.sparkTimer -= dt;
+    if (particles && this.sparkTimer <= 0) {
+      this.sparkTimer = 0.25;
+      particles.spawn({
+        pos: this.group.position,
+        vel: { x: (Math.random() - 0.5) * 5, y: 2 + Math.random() * 3, z: (Math.random() - 0.5) * 5 },
+        life: 0.8, size: 0.5, drag: 1.2, colors: powerupPalette(this.type), glow: 2.0,
+      });
+    }
+  }
+
+  dispose() {
+    this.coreMat.dispose();
+    this.symbolMat.dispose();
+    this.ringMat.dispose();
   }
 }

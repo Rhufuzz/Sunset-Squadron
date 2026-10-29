@@ -315,6 +315,96 @@ export class SoundEngine {
     o.stop(t + 0.15);
   }
 
+  /** Power-up collected: quick rising arpeggio, pitched per type, with a sparkle tail. */
+  pickup(type = 'turbo', volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const bases = { turbo: 440, shield: 392, rapid: 523.25, magnet: 349.23, ghost: 311.13, x2: 587.33 };
+    const base = bases[type] || 440;
+    const ratios = type === 'ghost' ? [1, 1.189, 1.414, 1.682] : [1, 1.25, 1.5, 2];
+    ratios.forEach((r, i) => {
+      const st = t + i * 0.06;
+      const o = ctx.createOscillator();
+      o.type = type === 'shield' ? 'sine' : 'triangle';
+      o.frequency.value = base * r;
+      const g = ctx.createGain();
+      this._env(g, st, 0.16 * volume, 0.008, 0.35);
+      o.connect(g).connect(this.master);
+      o.start(st);
+      o.stop(st + 0.4);
+    });
+    const shimmer = this._noiseSource(false);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(2500, t);
+    bp.frequency.exponentialRampToValueAtTime(6000, t + 0.3);
+    bp.Q.value = 3;
+    const sg = ctx.createGain();
+    this._env(sg, t, 0.07 * volume, 0.02, 0.35);
+    shimmer.connect(bp).connect(sg).connect(this.master);
+    shimmer.start(t);
+    shimmer.stop(t + 0.4);
+  }
+
+  /** Power-up ran out: soft two-note descending "power down". */
+  powerDown(volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    [660, 440].forEach((f, i) => {
+      const st = t + i * 0.12;
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.setValueAtTime(f, st);
+      o.frequency.exponentialRampToValueAtTime(f * 0.8, st + 0.18);
+      const g = ctx.createGain();
+      this._env(g, st, 0.1 * volume, 0.01, 0.2);
+      o.connect(g).connect(this.master);
+      o.start(st);
+      o.stop(st + 0.25);
+    });
+  }
+
+  /** Shield Bubble absorbed a hit: glassy crack + low thump. */
+  shieldBreak(volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const n = this._noiseSource(false);
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 3200;
+    const ng = ctx.createGain();
+    this._env(ng, t, 0.22 * volume, 0.003, 0.25);
+    n.connect(hp).connect(ng).connect(this.master);
+    n.start(t);
+    n.stop(t + 0.3);
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(1800, t);
+    o.frequency.exponentialRampToValueAtTime(400, t + 0.25);
+    const g = ctx.createGain();
+    this._env(g, t, 0.18 * volume, 0.005, 0.3);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + 0.35);
+  }
+
+  /** Personal-best sting on the round-end screen. */
+  personalBest(volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    [NOTE.C5, NOTE.G5, NOTE.D6, NOTE.D6 * 1.5].forEach((f, i) => {
+      const st = t + i * 0.1;
+      const o = ctx.createOscillator();
+      o.type = 'square';
+      o.frequency.value = f;
+      const g = ctx.createGain();
+      this._env(g, st, 0.08 * volume, 0.01, 0.45);
+      o.connect(g).connect(this.master);
+      o.start(st);
+      o.stop(st + 0.5);
+    });
+  }
+
   /** Round-over jingle: descending then rising arpeggio. */
   roundOver(volume = 1) {
     if (!this.ctx || this.muted) return;

@@ -1,10 +1,11 @@
 # Sunset Squadron: Crown Chase
 
 A zero-asset (100 % procedural geometry and audio) multiplayer 3D arcade jet game for up to 8 iPads
-on a shared network. Players join by scanning a QR code in the lobby, pick a pilot
-(Renji, Resa, Kaya or a squadron callsign) and a paint colour, then chase the Golden Crown or
-pop balloons and dive through neon ring gates in 3-minute rounds. 2–4 server-flown AI wingmen
-keep the sky busy even with only two iPads.
+on a shared network. Players join by scanning a QR code in the lobby, pick one of **8 pilot
+characters** (each with a signature jet livery, a procedural portrait and a small perk), then chase
+the Golden Crown or pop balloons and dive through neon ring gates in 3-minute rounds while grabbing
+glowing **power-up orbs**. 2–4 server-flown AI wingmen keep the sky busy even with only two iPads,
+and a persistent **all-time leaderboard** remembers every human pilot.
 
 - **Server:** Node.js, Express, Socket.io (20 Hz authoritative loop), `qrcode`
 - **Client:** plain ES modules served statically, Three.js 0.164.1 from the jsDelivr CDN via an importmap, Web Audio synthesizer
@@ -13,17 +14,23 @@ keep the sky busy even with only two iPads.
 ```
 sunset-squadron/
 ├── package.json
-├── server.js             # lobby, 20Hz game loop, bots, rockets, crown, balloons, gates, QR/host-info
+├── server.js             # lobby, 20Hz game loop, bots, rockets, crown, balloons, gates, power-ups, QR/host-info
+├── leaderboard.js        # persistent JSON leaderboard (atomic writes)
+├── shared/
+│   └── pilots.js         # the 8 pilots, perks and power-up definitions (served to the client as /js/pilots-data.js)
+├── data/
+│   └── leaderboard.json  # created automatically on first start (not part of the zip / git)
 └── public/
-    ├── index.html        # iOS PWA meta, lobby, HUD, touch controls, importmap
+    ├── index.html        # iOS PWA meta, lobby, character select, leaderboard, HUD, touch controls, importmap
     ├── style.css
     └── js/
-        ├── main.js       # state machine, Socket.io client, 60fps prediction + interpolation
+        ├── main.js       # state machine, Socket.io client, 60fps prediction + interpolation, HUD
         ├── world.js      # seeded PRNG, islands, arches/ring gates, ocean, sky dome, clouds
         ├── graphics.js   # renderer, ACES, lighting rig, time-of-day presets, bloom, particles
-        ├── entities.js   # jets, crown, ribbon contrail, balloons, rockets
+        ├── entities.js   # jets (per-pilot liveries + power-up FX), crown, ribbon, balloons, rockets, pickups
+        ├── portraits.js  # procedural canvas pilot portraits (helmet, visor, face, emblem)
         ├── controls.js   # multi-touch identifier tracking + keyboard fallback
-        └── audio.js      # procedural Web Audio sounds
+        └── audio.js      # procedural Web Audio sounds (incl. pickup / expire / shield / personal-best)
 ```
 
 ## Game modes (host picks in the lobby)
@@ -37,6 +44,79 @@ Controls on iPad: left half of the screen is a floating virtual stick (it appear
 right half has **BOOST** (hold = afterburner, tap = barrel roll that deflects rockets) and **FIREWORK**
 (hold = auto-fire). Desktop fallback: `WASD` / arrows steer, `Shift` boost (tap = roll, or `Q`), `Space` fires.
 Hitting water or rock never kills you — the jet just bounces.
+
+## Pilots (character select)
+
+Every player picks a pilot in the lobby grid (tap a card; the choice is remembered in the browser's
+`localStorage`, and you can still swap by tapping your own roster card before the round starts).
+The pilot's colours are painted on the jet body, wings and contrail, the portrait shows up in the
+roster, on in-game name tags, in the HUD and on the round-end screen. Each pilot has **one small
+perk** — all perks are multipliers of ±15–50 % on a single stat, so no pilot is strictly better.
+
+| Callsign | Name | Perk | Effect |
+| --- | --- | --- | --- |
+| **RENJI** | Renji Takahara | Turbo Heart | Boost stamina recharges 30 % faster |
+| **RESA** | Resa Okonkwo | Long Fuse | Power-ups last 30 % longer |
+| **KAYA** | Kaya Lindqvist | Knife Edge | 15 % tighter turning |
+| **VIPER** | Dmitri Volkov | Quick Load | Rockets reload 15 % faster |
+| **NOVA** | Priya Raman | Magnet Core | Pickup magnet radius +50 % |
+| **BLAZE** | Marco Ferreira | Hot Shot | Rockets lock on from 25 % further away |
+| **COMET** | Yuki Sato | Iron Wings | Recovers from hits twice as fast |
+| **ECHO** | Zara Haddad | Phantom Roll | Barrel rolls last 35 % longer (bigger deflect window) |
+
+**Duplicates are allowed:** two players may fly the same pilot. Players are told apart by the name
+they type (or the callsign if they leave it blank), so a family of four can all be KAYA if they insist.
+AI wingmen are given random pilots, preferring ones no human has picked. Perks are applied on the
+server (the client only predicts them), so they cannot be spoofed.
+
+## Power-ups
+
+Twelve glowing orbs float around the map at any time (`PICKUP_COUNT` in `server.js`); a collected
+orb respawns somewhere else after 20 seconds. Collection and all effects are **server-authoritative**
+and included in every snapshot, so every iPad sees the same shield bubble or turbo flames on the same
+jet. Active effects appear as HUD icons with a countdown bar; a sound plays on pickup and when an
+effect runs out. Bots will detour to grab orbs within ~220 m. Power-ups work in both modes.
+
+| Orb | Duration | Effect |
+| --- | --- | --- |
+| **Turbo Booster** (orange) | 6 s | Infinite boost stamina and a higher top speed |
+| **Shield Bubble** (cyan) | 25 s | Absorbs one rocket hit (the shield pops instead of you) |
+| **Rapid Fire** (red) | 8 s | Rockets reload three times faster |
+| **Magnet** (violet) | 10 s | Much larger pickup, balloon, crown and ribbon-steal range |
+| **Ghost** (lilac) | 8 s | Homing rockets cannot lock on to you |
+| **Score x2** (gold) | 10 s | Every point (crown seconds, balloons, gates) counts double |
+
+## Leaderboard
+
+The server keeps an **all-time leaderboard for human players only** (bots are never recorded), per
+*player name + pilot* and per game mode: wins, rounds played, best score, total points (crown seconds
+in Crown Tag, points in Blitz), balloons popped and rocket hits. It is updated at the end of every
+round with at least one human in it.
+
+- **Lobby:** top-10 panel with a *Crown Tag* / *Balloon Blitz* tab, your own row highlighted.
+- **In game:** live mini scoreboard in the top-right corner of the HUD.
+- **Round end:** new personal bests (first win, best score, …) are highlighted with a **NEW PB** badge.
+- **API:** `GET /api/leaderboard?limit=10` → `{ updatedAt, file, modes: { crown: [...], blitz: [...] }, totals }`.
+
+### Leaderboard data file
+
+The data lives in `data/leaderboard.json` (override with the `LEADERBOARD_FILE` environment
+variable). The file and the `data/` folder are created automatically on first start. Writes are
+atomic (temp file + rename) so a crash or power cut mid-write can never leave a half-written file;
+if the file is ever unreadable it is moved aside as `leaderboard.json.corrupt-<timestamp>` and a fresh
+board is started, so the game never refuses to boot because of it.
+
+- **Backup:** it is a single small JSON file — `cp data/leaderboard.json ~/leaderboard-$(date +%F).json`
+  (or add it to your existing backup job). Restore by copying it back while the server is stopped.
+- **Reset:** stop the server, delete `data/leaderboard.json`, start again.
+- **Upgrading:** the file is excluded from `sunset-squadron.zip` and from git, so unzipping a new
+  version over `/opt/sunset-squadron` keeps your scores. Back it up first anyway.
+- **Permissions:** the user that runs Node must be able to *create and write* inside `data/`.
+  With the systemd unit below (`User=www-data`) run `sudo chown -R www-data:www-data /opt/sunset-squadron`
+  (already in the instructions) or at least `sudo chown -R www-data:www-data /opt/sunset-squadron/data`.
+  With pm2 the file is owned by whichever user ran `pm2 start`; if you later switch users, `chown` the
+  `data/` directory to the new user. A permission problem is logged as `[leaderboard] save failed …`
+  and the game keeps running with the board in memory only.
 
 ## Requirements
 
@@ -60,6 +140,8 @@ Environment variables:
 | --- | --- | --- |
 | `PORT` | `3000` | TCP port to listen on (binds `0.0.0.0`) |
 | `PUBLIC_URL` | *(auto LAN IPv4)* | Full URL players should use, e.g. `https://squadron.example.com`. Used for the QR code. If unset the lobby also falls back to the page's own origin when the server only knows a private IP. |
+| `LEADERBOARD_FILE` | `data/leaderboard.json` | Where the persistent leaderboard is stored (see *Leaderboard data file*). |
+| `ROUND_SECONDS` | `180` | Round length in seconds — only change this for testing. |
 
 ## Installing on a VPS (Ubuntu / Debian)
 
@@ -211,3 +293,5 @@ group in their control panel where the same port must be opened.
 
 `GET /api/status` returns `{ phase, players, bots, settings, seed, timeRemaining }` and
 `GET /api/host-info` returns `{ url, qrDataUrl, seed }` — handy for uptime monitors.
+`GET /api/leaderboard` returns the all-time board, `GET /api/pilots` lists the pilots, perks and
+power-up definitions (the same data the client loads as the ES module `/js/pilots-data.js`).

@@ -3,9 +3,11 @@
 import * as THREE from 'three';
 import { Graphics, PRESETS } from './graphics.js';
 import { World, islandCollision, WATER_LEVEL, WORLD_RADIUS, CEILING } from './world.js';
-import { Jet, Crown, Ribbon, Balloon, Rocket, PAINT_COLORS, paintCss, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS } from './entities.js';
+import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
 import { Controls } from './controls.js';
 import { SoundEngine } from './audio.js';
+import { PILOTS, PERKS, POWERUPS, pilotById, perkMultipliers, hexCss } from './pilots-data.js';
+import { portraitCanvas, portraitElement } from './portraits.js';
 
 // ---------------------------------------------------------------------------
 // Constants shared with the server flight model
@@ -16,12 +18,12 @@ const SPEED_SUPER = 100;
 const ROCKET_SPEED = 130;
 const ROCKET_COOLDOWN = 1.2;
 const ROCKET_COOLDOWN_SUPER = 0.6;
+const ROCKET_COOLDOWN_RAPID = 0.4;
+const TURBO_SPEED = 95;
 const BARREL_ROLL_TIME = 0.45;
 const STATE_SEND_MS = 50;
 const LERP = 0.25;
 
-const CALLSIGNS = ['Renji', 'Resa', 'Kaya', 'Viper', 'Falcon', 'Nova', 'Blaze', 'Maverick', 'Comet', 'Echo', 'Bolt'];
-const STORY = new Set(['Renji', 'Resa', 'Kaya']);
 const MODE_LABEL = { crown: 'CROWN TAG', blitz: 'ARCH & BALLOON BLITZ' };
 
 const $ = (id) => document.getElementById(id);
@@ -50,13 +52,15 @@ const ui = {
   lobby: $('lobby'), hud: $('hud'), touch: $('touch-layer'), results: $('results'), rotateHint: $('rotate-hint'),
   qrImg: $('qr-img'), joinUrl: $('join-url'),
   pilotSetup: $('pilot-setup'), rosterPanel: $('roster-panel'), roster: $('roster'), rosterCount: $('roster-count'),
-  callsignPicker: $('callsign-picker'), colorPicker: $('color-picker'),
+  pilotGrid: $('pilot-grid'), rosterPicker: $('roster-pilot-picker'), playerName: $('player-name'),
+  pdPortrait: $('pd-portrait'), pdCallsign: $('pd-callsign'), pdName: $('pd-name'), pdBio: $('pd-bio'), pdPerk: $('pd-perk'), pdPerkDesc: $('pd-perk-desc'), pdSwatches: $('pd-swatches'),
+  lbTabs: $('lb-tabs'), lbBody: $('lb-body'), lbHint: $('lb-hint'),
   btnLaunch: $('btn-launch'), btnStart: $('btn-start'), joinError: $('join-error'), hostWait: $('host-wait'),
   modeToggle: $('mode-toggle'), presetToggle: $('preset-toggle'), botsToggle: $('bots-toggle'),
-  hudMode: $('hud-mode'), hudTimer: $('hud-timer'), hudCrown: $('hud-crown'), hudName: $('hud-name'), hudScore: $('hud-score'),
-  hudStamina: $('hud-stamina'), hudCooldown: $('hud-cooldown'), hudSpeed: $('hud-speed'), hudBoard: $('hud-board'),
+  hudMode: $('hud-mode'), hudTimer: $('hud-timer'), hudCrown: $('hud-crown'), hudName: $('hud-name'), hudCallsign: $('hud-callsign'), hudPortrait: $('hud-portrait'), hudScore: $('hud-score'),
+  hudStamina: $('hud-stamina'), hudCooldown: $('hud-cooldown'), hudSpeed: $('hud-speed'), hudBoard: $('hud-board'), hudPowerups: $('hud-powerups'),
   hudFeed: $('hud-feed'), hudBanner: $('hud-banner'), crownArrow: $('crown-arrow'),
-  resultsTitle: $('results-title'), resultsList: $('results-list'),
+  resultsTitle: $('results-title'), resultsList: $('results-list'), resultsBests: $('results-bests'),
   joyBase: $('joy-base'), joyKnob: $('joy-knob'), btnBoost: $('btn-boost'), btnFire: $('btn-fire'),
 };
 
@@ -73,9 +77,13 @@ const game = {
   phase: 'lobby',          // lobby | playing | ended
   myId: null,
   joined: false,
-  pilotName: CALLSIGNS[0],
-  pilotColor: 0,
+  pilotId: PILOTS[0].id,
+  playerName: '',
+  perk: perkMultipliers(PILOTS[0].id),
   lobby: null,
+  leaderboard: null,
+  lbMode: 'crown',
+  rosterEditing: false,
   mode: 'crown',
   preset: 'sunset',
   seed: 1,
@@ -85,7 +93,7 @@ const game = {
   lastSnap: null,
   lastSnapAt: 0,
   crownHolderId: null,
-  names: new Map(),        // id -> { name, color, isBot }
+  names: new Map(),        // id -> { name, pilot, isBot }
   attractAngle: 0,
 };
 
@@ -102,6 +110,8 @@ const me = {
   invuln: false,
   lastFire: -10,
   score: 0,
+  fx: {},                  // active power-ups: type -> seconds remaining (from the server)
+  fxAt: 0,
   quat: new THREE.Quaternion(),
   lastSplash: 0,
   lastBump: 0,
@@ -112,6 +122,7 @@ const me = {
 const remote = new Map();   // id -> { jet, pos, quat, spd, info, lastAt, forward }
 const rockets = new Map();  // id -> { mesh: Rocket, pos, dir, lastAt }
 const balloons = new Map(); // id -> { mesh: Balloon, alive }
+const pickups = new Map();  // id -> { mesh: Pickup, alive, type }
 let crown = null;
 let ribbon = null;
 let lastStateSent = 0;
@@ -122,40 +133,148 @@ const FWD = new THREE.Vector3(0, 0, -1);
 // ---------------------------------------------------------------------------
 // Lobby UI
 // ---------------------------------------------------------------------------
-function buildPickers() {
-  const savedName = localStorage.getItem('ss_name');
-  const savedColor = parseInt(localStorage.getItem('ss_color'), 10);
-  if (savedName && CALLSIGNS.includes(savedName)) game.pilotName = savedName;
-  if (!Number.isNaN(savedColor)) game.pilotColor = clamp(savedColor, 0, 7);
-  ui.callsignPicker.innerHTML = '';
-  for (const name of CALLSIGNS) {
-    const b = document.createElement('button');
-    b.textContent = name;
-    b.type = 'button';
-    if (STORY.has(name)) b.classList.add('story-char');
-    if (name === game.pilotName) b.classList.add('active');
-    b.addEventListener('click', () => {
-      game.pilotName = name;
-      localStorage.setItem('ss_name', name);
-      for (const c of ui.callsignPicker.children) c.classList.toggle('active', c.textContent === name);
-    });
-    ui.callsignPicker.appendChild(b);
+function pilotFor(id) {
+  const n = game.names.get(id);
+  return pilotById(n ? n.pilot : game.pilotId);
+}
+function trailCss(pilot) { return hexCss(pilot.colors.trail); }
+
+function makePilotCard(pilot, compact) {
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'pilot-card';
+  card.dataset.pilot = pilot.id;
+  card.setAttribute('role', 'option');
+  card.style.setProperty('--card-color', trailCss(pilot));
+  card.style.setProperty('--card-glow', trailCss(pilot) + '88');
+  card.appendChild(portraitElement(pilot, compact ? 56 : 96));
+  const cs = document.createElement('span');
+  cs.className = 'pc-callsign';
+  cs.textContent = pilot.callsign;
+  card.appendChild(cs);
+  if (!compact) {
+    const pk = document.createElement('span');
+    pk.className = 'pc-perk';
+    pk.textContent = PERKS[pilot.perk].label;
+    card.appendChild(pk);
   }
-  ui.colorPicker.innerHTML = '';
-  PAINT_COLORS.forEach((c, i) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.title = c.name;
-    b.style.background = paintCss(i);
-    b.style.color = paintCss(i);
-    if (i === game.pilotColor) b.classList.add('active');
-    b.addEventListener('click', () => {
-      game.pilotColor = i;
-      localStorage.setItem('ss_color', String(i));
-      Array.from(ui.colorPicker.children).forEach((el, j) => el.classList.toggle('active', j === i));
-    });
-    ui.colorPicker.appendChild(b);
+  const check = document.createElement('span');
+  check.className = 'pc-check';
+  check.textContent = '✓';
+  card.appendChild(check);
+  return card;
+}
+
+function renderPilotDetail(pilot) {
+  ui.pdPortrait.innerHTML = '';
+  ui.pdPortrait.appendChild(portraitElement(pilot, 110));
+  ui.pdCallsign.textContent = pilot.callsign;
+  ui.pdCallsign.style.color = trailCss(pilot);
+  ui.pdName.textContent = pilot.name;
+  ui.pdBio.textContent = pilot.bio;
+  ui.pdPerk.textContent = PERKS[pilot.perk].label;
+  ui.pdPerkDesc.textContent = PERKS[pilot.perk].desc;
+  ui.pdSwatches.innerHTML = '';
+  for (const [key, label] of [['body', 'BODY'], ['wing', 'WING'], ['trail', 'TRAIL']]) {
+    const sw = document.createElement('span');
+    sw.style.background = hexCss(pilot.colors[key]);
+    sw.style.color = hexCss(pilot.colors[key]);
+    sw.title = label;
+    ui.pdSwatches.appendChild(sw);
+  }
+  const lbl = document.createElement('small');
+  lbl.textContent = 'BODY · WING · TRAIL';
+  ui.pdSwatches.appendChild(lbl);
+}
+
+function selectPilot(id, fromRoster) {
+  const pilot = pilotById(id);
+  game.pilotId = pilot.id;
+  game.perk = perkMultipliers(pilot.id);
+  localStorage.setItem('ss_pilot', pilot.id);
+  for (const grid of [ui.pilotGrid, ui.rosterPicker]) {
+    for (const c of grid.children) c.classList.toggle('active', c.dataset.pilot === pilot.id);
+  }
+  renderPilotDetail(pilot);
+  sound.blip(520 + PILOTS.indexOf(pilot) * 40, 0.4);
+  if (fromRoster && socket && game.joined) socket.emit('setPilot', { pilot: pilot.id });
+}
+
+function buildPickers() {
+  const savedPilot = localStorage.getItem('ss_pilot');
+  if (savedPilot && PILOTS.some((p) => p.id === savedPilot)) game.pilotId = savedPilot;
+  const savedName = localStorage.getItem('ss_player_name');
+  if (savedName) { game.playerName = savedName.slice(0, 14); ui.playerName.value = game.playerName; }
+  ui.pilotGrid.innerHTML = '';
+  ui.rosterPicker.innerHTML = '';
+  for (const pilot of PILOTS) {
+    const card = makePilotCard(pilot, false);
+    card.addEventListener('click', () => selectPilot(pilot.id, false));
+    ui.pilotGrid.appendChild(card);
+    const small = makePilotCard(pilot, true);
+    small.addEventListener('click', () => { selectPilot(pilot.id, true); });
+    ui.rosterPicker.appendChild(small);
+  }
+  selectPilot(game.pilotId, false);
+  ui.playerName.addEventListener('input', () => {
+    game.playerName = ui.playerName.value.replace(/[^\w\- ]/g, '').slice(0, 14);
+    localStorage.setItem('ss_player_name', game.playerName);
   });
+  ui.playerName.addEventListener('keydown', (e) => { if (e.key === 'Enter') { ui.playerName.blur(); launch(); } });
+  for (const b of ui.lbTabs.children) b.addEventListener('click', () => { game.lbMode = b.dataset.lbmode; renderLeaderboard(); });
+}
+
+// ---------------------------------------------------------------------------
+// Leaderboard panel
+// ---------------------------------------------------------------------------
+function renderLeaderboard() {
+  for (const b of ui.lbTabs.children) b.classList.toggle('active', b.dataset.lbmode === game.lbMode);
+  const lb = game.leaderboard;
+  const rows = lb && lb.modes && lb.modes[game.lbMode] ? lb.modes[game.lbMode] : [];
+  ui.lbBody.innerHTML = '';
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    tr.className = 'empty';
+    tr.innerHTML = '<td colspan="5">No rounds recorded yet - be the first!</td>';
+    ui.lbBody.appendChild(tr);
+  }
+  const myName = game.joined ? (game.names.get(game.myId) || {}).name : null;
+  for (const e of rows) {
+    const pilot = pilotById(e.pilot);
+    const tr = document.createElement('tr');
+    if (myName && e.name === myName && e.pilot === game.pilotId) tr.classList.add('mine');
+    const unit = game.lbMode === 'crown' ? `${Math.round(e.totalPoints)}s crown` : `${e.balloons} balloons`;
+    tr.innerHTML = `<td class="num">${e.rank}</td><td></td><td class="num">${e.wins}</td><td class="num">${e.bestScore}</td><td class="num">${e.rounds}</td>`;
+    const cell = tr.children[1];
+    const wrap = document.createElement('div');
+    wrap.className = 'lb-pilot';
+    wrap.appendChild(portraitElement(pilot, 22));
+    const txt = document.createElement('span');
+    txt.className = 'lb-name';
+    txt.textContent = e.name;
+    txt.title = `${e.name} as ${pilot.callsign} · ${e.wins} wins · ${e.rounds} rounds · best ${e.bestScore} · ${unit} · ${e.hits} hits`;
+    const cs = document.createElement('span');
+    cs.className = 'lb-cs';
+    cs.textContent = `${pilot.callsign} · ${unit} · ${e.hits} hits`;
+    txt.appendChild(cs);
+    wrap.appendChild(txt);
+    cell.appendChild(wrap);
+    ui.lbBody.appendChild(tr);
+  }
+  if (lb && lb.totals) {
+    const n = lb.totals[game.lbMode] || 0;
+    ui.lbHint.textContent = n ? `${n} pilot${n === 1 ? '' : 's'} on the ${game.lbMode === 'crown' ? 'Crown Tag' : 'Blitz'} board · humans only · wins, then best score` : 'Humans only · sorted by wins, then best score';
+  }
+}
+
+async function loadLeaderboard() {
+  try {
+    const res = await fetch('/api/leaderboard', { cache: 'no-store' });
+    game.leaderboard = await res.json();
+    renderLeaderboard();
+  } catch (err) {
+    console.warn('leaderboard fetch failed', err);
+  }
 }
 
 function isPrivateHost(host) {
@@ -190,17 +309,23 @@ function renderRoster(lobby) {
   const isHost = lobby.hostId === game.myId;
   ui.roster.innerHTML = '';
   for (const p of lobby.players) {
-    game.names.set(p.id, { name: p.name, color: p.color, isBot: p.isBot });
+    game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot });
+    const pilot = pilotById(p.pilot);
     const li = document.createElement('li');
     if (p.isBot) li.classList.add('bot');
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    dot.style.background = paintCss(p.color);
-    dot.style.color = paintCss(p.color);
-    li.appendChild(dot);
+    li.style.borderColor = p.id === game.myId ? '' : trailCss(pilot) + '66';
+    li.appendChild(portraitElement(pilot, 34));
+    const txt = document.createElement('span');
+    txt.className = 'r-text';
     const nm = document.createElement('span');
     nm.textContent = p.name;
-    li.appendChild(nm);
+    nm.style.color = trailCss(pilot);
+    const cs = document.createElement('span');
+    cs.className = 'r-callsign';
+    cs.textContent = `${pilot.callsign} · ${PERKS[pilot.perk].label}`;
+    txt.appendChild(nm);
+    txt.appendChild(cs);
+    li.appendChild(txt);
     if (p.id === lobby.hostId) {
       const tag = document.createElement('span');
       tag.className = 'tag';
@@ -208,13 +333,29 @@ function renderRoster(lobby) {
       li.appendChild(tag);
     }
     if (p.id === game.myId) {
+      li.classList.add('me');
+      li.classList.toggle('editing', game.rosterEditing);
       const tag = document.createElement('span');
       tag.className = 'tag';
       tag.textContent = 'YOU';
       li.appendChild(tag);
+      li.title = 'Tap to change pilot';
+      li.addEventListener('click', () => {
+        if (lobby.phase !== 'lobby') return;
+        game.rosterEditing = !game.rosterEditing;
+        li.classList.toggle('editing', game.rosterEditing);
+        ui.rosterPicker.classList.toggle('hidden', !game.rosterEditing);
+      });
+      if (p.pilot !== game.pilotId) {
+        // Server confirmed a different pilot than the one shown locally - follow the server
+        game.pilotId = p.pilot;
+        game.perk = perkMultipliers(p.pilot);
+        for (const c of ui.rosterPicker.children) c.classList.toggle('active', c.dataset.pilot === p.pilot);
+      }
     }
     ui.roster.appendChild(li);
   }
+  if (lobby.phase !== 'lobby') { game.rosterEditing = false; ui.rosterPicker.classList.add('hidden'); }
   const humans = lobby.players.filter((p) => !p.isBot).length;
   ui.rosterCount.textContent = `${humans}/8 pilots · ${lobby.settings.bots} AI wingmen`;
   for (const b of ui.modeToggle.children) b.classList.toggle('active', b.dataset.mode === lobby.settings.mode);
@@ -231,6 +372,7 @@ function renderRoster(lobby) {
     gfx.applyPreset(game.preset);
   }
   game.mode = lobby.settings.mode;
+  if (lobby.leaderboard) { game.leaderboard = lobby.leaderboard; renderLeaderboard(); }
 }
 
 function wireLobby() {
@@ -247,6 +389,8 @@ let launching = false;
 function launch() {
   if (launching || game.joined) return;
   launching = true;
+  game.playerName = ui.playerName.value.replace(/[^\w\- ]/g, '').slice(0, 14).trim();
+  localStorage.setItem('ss_player_name', game.playerName);
   sound.initAndUnlock();
   sound.blip(660);
   ui.joinError.textContent = '';
@@ -299,11 +443,15 @@ function connectSocket() {
     b.mesh.group.visible = true;
     b.alive = true;
   });
+  socket.on('pickup', (e) => onPickup(e));
+  socket.on('pickupSpawn', (e) => spawnPickupMesh(e));
+  socket.on('fxEnd', (e) => onFxEnd(e));
+  socket.on('shieldBreak', (e) => onShieldBreak(e));
 }
 
 function doJoin() {
   if (!socket) return;
-  socket.emit('join', { name: game.pilotName, color: game.pilotColor }, (ack) => {
+  socket.emit('join', { name: game.playerName, pilot: game.pilotId }, (ack) => {
     launching = false;
     if (!ack || !ack.ok) {
       ui.joinError.textContent = ack && ack.error ? ack.error : 'Could not join.';
@@ -342,9 +490,26 @@ function clearRoundEntities() {
   rockets.clear();
   for (const b of balloons.values()) gfx.scene.remove(b.mesh.group);
   balloons.clear();
+  for (const k of pickups.values()) { gfx.scene.remove(k.mesh.group); k.mesh.dispose(); }
+  pickups.clear();
   if (crown) { gfx.scene.remove(crown.group); crown = null; }
   if (ribbon) { gfx.scene.remove(ribbon.mesh); ribbon = null; }
   ui.hudFeed.innerHTML = '';
+  ui.hudPowerups.innerHTML = '';
+  me.fx = {};
+  puHtml = '';
+}
+
+function spawnPickupMesh(k) {
+  let entry = pickups.get(k.id);
+  if (entry) { gfx.scene.remove(entry.mesh.group); entry.mesh.dispose(); }
+  const mesh = new Pickup(k.type);
+  mesh.setPosition(k.x, k.y, k.z);
+  mesh.group.visible = k.alive !== false;
+  gfx.scene.add(mesh.group);
+  entry = { mesh, alive: k.alive !== false, type: k.type };
+  pickups.set(k.id, entry);
+  return entry;
 }
 
 function buildWorld(seed) {
@@ -367,17 +532,20 @@ function startRound(data) {
   buildWorld(data.seed);
   gfx.applyPreset(data.preset);
 
-  for (const p of data.players) game.names.set(p.id, { name: p.name, color: p.color, isBot: p.isBot });
+  for (const p of data.players) game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot });
 
   // Local jet
   const self = data.players.find((p) => p.id === game.myId);
+  if (self) { game.pilotId = self.pilot; game.perk = perkMultipliers(self.pilot); }
+  const myPilot = pilotById(game.pilotId);
+  const myName = self ? self.name : (game.playerName || myPilot.callsign);
   if (me.jet) { gfx.scene.remove(me.jet.group); me.jet.dispose(); }
-  me.jet = new Jet(game.pilotColor, game.pilotName);
+  me.jet = new Jet(myPilot, myName, portraitCanvas(myPilot, 64));
   gfx.scene.add(me.jet.group);
   if (self) { me.pos.set(self.pos.x, self.pos.y, self.pos.z); me.yaw = self.yaw; }
   else { me.pos.set(0, 90, 260); me.yaw = 0; }
   me.pitch = 0; me.roll = 0; me.speed = SPEED_BASE; me.stamina = 1; me.rollingUntil = 0; me.tumble = 0;
-  me.superUntil = 0; me.invuln = false; me.lastFire = -10; me.score = 0;
+  me.superUntil = 0; me.invuln = false; me.lastFire = -10; me.score = 0; me.fx = {}; me.fxAt = nowS();
   quatFromYPR(me.quat, me.yaw, 0, 0);
   me.jet.group.position.copy(me.pos);
   me.jet.group.quaternion.copy(me.quat);
@@ -404,6 +572,8 @@ function startRound(data) {
       balloons.set(b.id, { mesh, alive: b.alive });
     }
   }
+  // Power-up orbs (both modes)
+  for (const k of data.pickups || []) spawnPickupMesh(k);
 
   // UI
   ui.lobby.classList.add('hidden');
@@ -411,7 +581,12 @@ function startRound(data) {
   ui.hud.classList.remove('hidden');
   ui.touch.classList.remove('hidden');
   ui.hudMode.textContent = MODE_LABEL[data.mode] || data.mode.toUpperCase();
-  ui.hudName.textContent = game.pilotName;
+  ui.hudName.textContent = myName;
+  ui.hudName.style.color = trailCss(myPilot);
+  ui.hudCallsign.textContent = `${myPilot.callsign} · ${PERKS[myPilot.perk].label}`;
+  const hp = ui.hudPortrait.getContext('2d');
+  hp.clearRect(0, 0, ui.hudPortrait.width, ui.hudPortrait.height);
+  hp.drawImage(portraitCanvas(myPilot, 128), 0, 0, ui.hudPortrait.width, ui.hudPortrait.height);
   ui.hudScore.textContent = '0';
   controls.setEnabled(true);
   checkOrientation();
@@ -425,13 +600,37 @@ function endRound(results) {
   controls.setEnabled(false);
   ui.touch.classList.add('hidden');
   ui.results.classList.remove('hidden');
+  ui.hudPowerups.innerHTML = '';
   ui.resultsTitle.textContent = results.results.length && results.results[0].id === game.myId ? 'YOU WIN!' : 'ROUND OVER';
   ui.resultsList.innerHTML = '';
+  let myBests = [];
   results.results.forEach((r, i) => {
+    const pilot = pilotById(r.pilot);
     const li = document.createElement('li');
-    li.innerHTML = `<span class="rank">${i + 1}.</span><span class="dot" style="background:${paintCss(r.color)};color:${paintCss(r.color)}"></span><span class="nm">${escapeHtml(r.name)}${r.id === game.myId ? ' (you)' : ''}</span><span class="sc">${r.score}</span>`;
+    const st = r.stats || {};
+    const statTxt = results.mode === 'crown' ? `${st.crownTime || 0}s crown · ${st.hits || 0} hits` : `${st.balloons || 0} balloons · ${st.hits || 0} hits`;
+    li.innerHTML = `<span class="rank">${i + 1}.</span><span class="portrait-slot"></span><span class="nm">${escapeHtml(r.name)}${r.id === game.myId ? ' (you)' : ''}<small>${escapeHtml(pilot.callsign)}${r.isBot ? ' · AI' : ''}</small></span><span class="st">${statTxt}</span><span class="sc">${r.score}</span>`;
+    li.querySelector('.portrait-slot').replaceWith(portraitElement(pilot, 30));
+    li.querySelector('.nm').style.color = trailCss(pilot);
+    if (r.newBests && r.newBests.length) {
+      const pb = document.createElement('span');
+      pb.className = 'pb';
+      pb.textContent = r.id === game.myId ? 'NEW PB' : 'PB';
+      pb.title = r.newBests.join(' · ');
+      li.appendChild(pb);
+    }
+    if (r.id === game.myId) myBests = r.newBests || [];
     ui.resultsList.appendChild(li);
   });
+  if (myBests.length) {
+    ui.resultsBests.classList.remove('hidden');
+    ui.resultsBests.innerHTML = `<div class="pb-title">PERSONAL BEST</div>${myBests.map((b) => `<div>★ ${escapeHtml(b)}</div>`).join('')}`;
+    sound.personalBest();
+  } else {
+    ui.resultsBests.classList.add('hidden');
+    ui.resultsBests.innerHTML = '';
+  }
+  if (results.leaderboard) { game.leaderboard = results.leaderboard; renderLeaderboard(); }
   sound.roundOver();
   sound.updateEngine(0, false);
   gfx.targetFov = 60;
@@ -455,12 +654,15 @@ function onSnapshot(snap) {
       me.superUntil = p.su > 0 ? t + p.su : 0;
       me.invuln = Boolean(p.iv);
       if (p.tu > 0) me.tumble = Math.max(me.tumble, p.tu);
+      me.fx = p.fx || {};
+      me.fxAt = t;
       continue;
     }
     let r = remote.get(p.id);
     if (!r) {
-      const info = game.names.get(p.id) || { name: 'Pilot', color: 0 };
-      const jet = new Jet(info.color, info.name);
+      const info = game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id };
+      const pilot = pilotById(info.pilot);
+      const jet = new Jet(pilot, info.name, portraitCanvas(pilot, 64));
       jet.group.position.set(p.p[0], p.p[1], p.p[2]);
       jet.group.quaternion.set(p.q[0], p.q[1], p.q[2], p.q[3]);
       gfx.scene.add(jet.group);
@@ -471,7 +673,7 @@ function onSnapshot(snap) {
     r.quat.set(p.q[0], p.q[1], p.q[2], p.q[3]);
     r.spd = p.spd;
     r.forward.copy(FWD).applyQuaternion(r.quat);
-    r.info = { boost: Boolean(p.b), super: p.su > 0, invuln: Boolean(p.iv), tumble: p.tu, score: p.sc };
+    r.info = { boost: Boolean(p.b), super: p.su > 0, invuln: Boolean(p.iv), tumble: p.tu, score: p.sc, fx: p.fx || {} };
     r.tumble = p.tu;
     r.lastAt = t;
   }
@@ -484,8 +686,7 @@ function onSnapshot(snap) {
     seenR.add(rk.id);
     let r = rockets.get(rk.id);
     if (!r) {
-      const info = game.names.get(rk.o) || { color: 0 };
-      const mesh = new Rocket(info.color);
+      const mesh = new Rocket(pilotFor(rk.o).colors.trail);
       mesh.group.position.set(rk.p[0], rk.p[1], rk.p[2]);
       gfx.scene.add(mesh.group);
       r = { mesh, pos: new THREE.Vector3(), dir: new THREE.Vector3(), lastAt: t, fresh: true };
@@ -503,6 +704,13 @@ function onSnapshot(snap) {
     snap.balloons.forEach((alive, i) => {
       const b = balloons.get(i);
       if (b && b.alive !== Boolean(alive)) { b.alive = Boolean(alive); b.mesh.group.visible = b.alive; }
+    });
+  }
+  // Power-up orbs alive flags
+  if (snap.pickups && snap.pickups.length) {
+    snap.pickups.forEach((alive, i) => {
+      const k = pickups.get(i);
+      if (k && k.alive !== Boolean(alive)) { k.alive = Boolean(alive); k.mesh.group.visible = k.alive; }
     });
   }
   // Crown + ribbon
@@ -576,6 +784,49 @@ function onCrownEvent(e) {
   }
 }
 
+function onPickup(e) {
+  const p = arrToV(e.p);
+  const def = POWERUPS[e.type] || { label: e.type, short: e.type };
+  gfx.particles.burst(p, 34, 24, { colors: powerupPalette(e.type), life: 0.9, size: 1.5, glow: 2.2 });
+  const k = pickups.get(e.id);
+  if (k) { k.alive = false; k.mesh.group.visible = false; }
+  if (e.by === game.myId) {
+    sound.pickup(e.type);
+    showBanner(def.short === 'x2' ? 'SCORE x2!' : `${def.short}!`);
+    addFeed(`${def.label}: ${def.desc} (${Math.round(e.dur)}s)`);
+    gfx.addShake(0.15);
+    // Predict locally until the next snapshot confirms it
+    me.fx = { ...me.fx, [e.type]: Math.max(me.fx[e.type] || 0, e.dur) };
+    me.fxAt = nowS();
+  } else {
+    sound.pickup(e.type, volumeForDistance(p.distanceTo(me.pos)) * 0.4);
+    addFeed(`${nameOf(e.by)} grabbed ${def.label}`);
+  }
+}
+
+function onFxEnd(e) {
+  if (e.id === game.myId) {
+    const def = POWERUPS[e.type];
+    if (me.fx[e.type] !== undefined) { const fx = { ...me.fx }; delete fx[e.type]; me.fx = fx; }
+    sound.powerDown();
+    if (def) addFeed(`${def.label} wore off`);
+  }
+}
+
+function onShieldBreak(e) {
+  const p = arrToV(e.p);
+  gfx.particles.burst(p, 40, 28, { colors: SHIELD_COLORS, life: 0.9, size: 1.6, glow: 2.2 });
+  if (e.id === game.myId) {
+    sound.shieldBreak();
+    showBanner('SHIELD BLOCKED IT!');
+    gfx.addShake(0.4);
+    if (me.fx.shield !== undefined) { const fx = { ...me.fx }; delete fx.shield; me.fx = fx; }
+  } else {
+    sound.shieldBreak(volumeForDistance(p.distanceTo(me.pos)) * 0.6);
+    if (e.by === game.myId) addFeed(`${nameOf(e.id)}'s shield absorbed your firework`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // HUD helpers
 // ---------------------------------------------------------------------------
@@ -603,10 +854,13 @@ function showBanner(text) {
 let boardHtml = '';
 function updateBoard(snap) {
   const rows = snap.players
-    .map((p) => ({ id: p.id, sc: p.sc, ...(game.names.get(p.id) || { name: 'Pilot', color: 0 }) }))
+    .map((p) => ({ id: p.id, sc: p.sc, ...(game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id }) }))
     .sort((a, b) => b.sc - a.sc)
     .slice(0, 8);
-  const html = rows.map((r) => `<div class="row${r.id === game.myId ? ' me' : ''}${r.id === snap.crownHolderId ? ' crown' : ''}"><span class="dot" style="background:${paintCss(r.color)};color:${paintCss(r.color)}"></span><span class="nm">${escapeHtml(r.name)}</span><span class="sc">${r.sc}</span></div>`).join('');
+  const html = rows.map((r, i) => {
+    const css = trailCss(pilotById(r.pilot));
+    return `<div class="row${r.id === game.myId ? ' me' : ''}${r.id === snap.crownHolderId ? ' crown' : ''}"><span class="rank">${i + 1}</span><span class="dot" style="background:${css};color:${css}"></span><span class="nm">${escapeHtml(r.name)}</span><span class="sc">${r.sc}</span></div>`;
+  }).join('');
   if (html !== boardHtml) { boardHtml = html; ui.hudBoard.innerHTML = html; }
   const holder = snap.crownHolderId ? nameOf(snap.crownHolderId) : (game.mode === 'crown' ? 'loose!' : '');
   ui.hudCrown.textContent = game.mode === 'crown' ? `👑 ${holder}` : `🎈 ${snap.balloons.filter(Boolean).length} left`;
@@ -617,6 +871,35 @@ function formatTime(s) {
   const r = Math.floor(s % 60);
   return `${m}:${r.toString().padStart(2, '0')}`;
 }
+
+// Inline SVG glyphs for the power-up HUD (procedural, no image files)
+const PU_SVG = {
+  turbo: '<svg viewBox="0 0 32 32"><path d="M4 18 L18 18 L18 10 L28 16 L18 22 L18 14 Z" fill="currentColor" transform="translate(0,-1)"/><path d="M4 12 L12 12 M4 24 L14 24" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>',
+  shield: '<svg viewBox="0 0 32 32"><path d="M16 3 L27 7 V15 C27 22 22 27 16 29 C10 27 5 22 5 15 V7 Z" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/><path d="M11 15 L15 19 L22 11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  rapid: '<svg viewBox="0 0 32 32"><g fill="currentColor"><path d="M7 4 L10 10 V22 L7 26 L4 22 V10 Z"/><path d="M16 2 L19 8 V24 L16 29 L13 24 V8 Z"/><path d="M25 4 L28 10 V22 L25 26 L22 22 V10 Z"/></g></svg>',
+  magnet: '<svg viewBox="0 0 32 32"><path d="M8 4 V16 A8 8 0 0 0 24 16 V4" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="butt"/><rect x="5" y="3" width="6" height="7" fill="#ff5e5b"/><rect x="21" y="3" width="6" height="7" fill="#ff5e5b"/></svg>',
+  ghost: '<svg viewBox="0 0 32 32"><path d="M6 29 V15 A10 10 0 0 1 26 15 V29 L22 25 L18 29 L14 25 L10 29 Z" fill="currentColor" opacity="0.85"/><circle cx="12" cy="15" r="2" fill="#1a1030"/><circle cx="20" cy="15" r="2" fill="#1a1030"/></svg>',
+  x2: '<svg viewBox="0 0 32 32"><text x="16" y="23" text-anchor="middle" font-size="20" font-weight="900" font-family="system-ui, sans-serif" fill="currentColor">x2</text></svg>',
+};
+let puHtml = '';
+function updatePowerupHud() {
+  const t = nowS();
+  const age = t - me.fxAt;
+  const parts = [];
+  for (const type of Object.keys(me.fx)) {
+    const remain = me.fx[type] - age;
+    if (remain <= 0) continue;
+    const def = POWERUPS[type];
+    if (!def) continue;
+    const total = def.duration * game.perk.fxDuration;
+    const frac = clamp(remain / total, 0, 1);
+    const css = hexCss(def.color);
+    parts.push(`<div class="pu-icon${remain < 2 ? ' ending' : ''}" style="--pu-color:${css};color:${css}" data-type="${type}">${PU_SVG[type] || ''}<span class="pu-label">${def.short}</span><span class="pu-time">${remain.toFixed(remain < 10 ? 1 : 0)}</span><span class="pu-bar" style="width:${Math.round(frac * 100)}%"></span></div>`);
+  }
+  const html = parts.join('');
+  if (html !== puHtml) { puHtml = html; ui.hudPowerups.innerHTML = html; }
+}
+function hasFx(type) { return me.fx[type] !== undefined && me.fx[type] - (nowS() - me.fxAt) > 0; }
 
 function checkOrientation() {
   const touch = 'ontouchstart' in window && navigator.maxTouchPoints > 0;
@@ -634,20 +917,24 @@ function stepLocalFlight(dt) {
   const joyX = controls.joyX;
   const joyY = controls.joyY;
   let boost = controls.boost;
+  const rollTime = BARREL_ROLL_TIME * game.perk.rollTime;
   if (controls.takeRollTap() && t >= me.rollingUntil) {
-    me.rollingUntil = t + BARREL_ROLL_TIME;
+    me.rollingUntil = t + rollTime;
     sound.rollSwoosh();
     if (socket) socket.emit('barrelRoll');
   }
   const sup = t < me.superUntil;
-  if (boost && me.stamina > 0.02) me.stamina = Math.max(0, me.stamina - dt * 0.45);
-  else { boost = false; me.stamina = Math.min(1, me.stamina + dt * 0.28); }
+  const turbo = hasFx('turbo');
+  const regen = 0.28 * game.perk.stamRegen;
+  if (turbo) { boost = true; me.stamina = Math.min(1, me.stamina + dt * regen); }
+  else if (boost && me.stamina > 0.02) me.stamina = Math.max(0, me.stamina - dt * 0.45);
+  else { boost = false; me.stamina = Math.min(1, me.stamina + dt * regen); }
   if (boost && !me.wasBoosting) sound.boostWhoosh(0.8);
   me.wasBoosting = boost;
   me.boost = boost;
-  const target = sup ? SPEED_SUPER : (boost || me.invuln) ? SPEED_BOOST : SPEED_BASE;
+  const target = sup ? SPEED_SUPER : turbo ? TURBO_SPEED : (boost || me.invuln) ? SPEED_BOOST : SPEED_BASE;
   me.speed = lerp(me.speed, target, Math.min(1, dt * 3));
-  me.yaw = wrapAngle(me.yaw + -joyX * 2.1 * dt);
+  me.yaw = wrapAngle(me.yaw + -joyX * 2.1 * game.perk.turn * dt);
   me.pitch = lerp(me.pitch, -joyY * 0.75, Math.min(1, dt * 6));
   me.roll = lerp(me.roll, -joyX * 1.05, Math.min(1, dt * 8));
   forwardFromYP(tmpV, me.yaw, me.pitch);
@@ -689,15 +976,17 @@ function stepLocalFlight(dt) {
 
   // Visual roll (+ barrel roll)
   let visualRoll = me.roll;
-  if (t < me.rollingUntil) visualRoll += ((me.rollingUntil - t) / BARREL_ROLL_TIME) * Math.PI * 2;
+  if (t < me.rollingUntil) visualRoll += ((me.rollingUntil - t) / rollTime) * Math.PI * 2;
   quatFromYPR(me.quat, me.yaw, me.pitch, visualRoll);
   me.jet.group.position.copy(me.pos);
   me.jet.group.quaternion.copy(me.quat);
   if (me.tumble > 0) me.tumble = Math.max(0, me.tumble - dt);
-  me.jet.updateVisual(dt, { boost, super: sup, invuln: me.invuln, tumble: me.tumble }, gfx.particles, t);
+  me.jet.updateVisual(dt, { boost, super: sup, invuln: me.invuln, tumble: me.tumble, fx: activeFx() }, gfx.particles, t);
 
   // Fire
-  const cd = sup ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
+  let cd = sup ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
+  if (hasFx('rapid')) cd = Math.min(cd, ROCKET_COOLDOWN_RAPID);
+  cd *= game.perk.reload;
   if (controls.fire && t - me.lastFire >= cd) {
     me.lastFire = t;
     if (socket) socket.emit('fire');
@@ -736,6 +1025,15 @@ function stepLocalFlight(dt) {
   ui.hudSpeed.textContent = Math.round(me.speed).toString();
   ui.hudScore.textContent = String(me.score);
   updateCrownArrow();
+  updatePowerupHud();
+}
+
+/** Active power-ups as a plain { type: true } map for the jet visuals. */
+function activeFx() {
+  const age = nowS() - me.fxAt;
+  const out = {};
+  for (const type of Object.keys(me.fx)) if (me.fx[type] - age > 0) out[type] = true;
+  return out;
 }
 
 function updateCrownArrow() {
@@ -763,7 +1061,7 @@ function stepRemote(dt) {
     r.jet.group.position.lerp(tmpV, LERP);
     r.jet.group.quaternion.slerp(r.quat, LERP);
     if (r.tumble > 0) r.tumble = Math.max(0, r.tumble - dt);
-    r.jet.updateVisual(dt, { boost: r.info.boost, super: r.info.super, invuln: r.info.invuln, tumble: r.tumble }, gfx.particles, t);
+    r.jet.updateVisual(dt, { boost: r.info.boost, super: r.info.super, invuln: r.info.invuln, tumble: r.tumble, fx: r.info.fx }, gfx.particles, t);
   }
   for (const r of rockets.values()) {
     const age = Math.min(0.2, t - r.lastAt);
@@ -775,6 +1073,7 @@ function stepRemote(dt) {
     r.mesh.update(dt, gfx.particles);
   }
   for (const b of balloons.values()) if (b.alive) b.mesh.update(dt, t);
+  for (const k of pickups.values()) if (k.alive) k.mesh.update(dt, t, k.mesh.group.position.distanceTo(gfx.camera.position) < 350 ? gfx.particles : null);
   if (crown) {
     const holderId = game.crownHolderId;
     if (holderId) {
@@ -836,12 +1135,13 @@ async function boot() {
   buildPickers();
   wireLobby();
   const info = await loadHostInfo();
+  loadLeaderboard();
   buildWorld(info ? info.seed : 1337);
   gfx.applyPreset('sunset');
   document.addEventListener('visibilitychange', () => { if (!document.hidden) sound.resume(); });
   window.addEventListener('pointerdown', () => sound.resume(), { passive: true });
   requestAnimationFrame(frame);
-  window.__sunset = { game, me, remote, rockets, balloons, gfx, controls, get world() { return world; }, get socket() { return socket; } };
+  window.__sunset = { game, me, remote, rockets, balloons, pickups, gfx, controls, PILOTS, POWERUPS, get world() { return world; }, get socket() { return socket; } };
 }
 
 boot();
