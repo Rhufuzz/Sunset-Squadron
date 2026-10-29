@@ -121,6 +121,8 @@ const POWERUPS = {
   magnet: { label: 'Magnet', short: 'MAGNET', desc: 'Huge pickup, balloon, crown and ribbon range.', duration: 10, color: 0xb6ff3c },
   ghost: { label: 'Ghost', short: 'GHOST', desc: 'Homing rockets cannot lock on to you.', duration: 8, color: 0xc9a6ff },
   x2: { label: 'Score x2', short: 'x2', desc: 'Every point counts double.', duration: 10, color: 0xffd54a },
+  mine: { label: 'Sky Mine', short: 'MINE', desc: 'Drops an armed proximity mine behind your jet.', duration: 25, color: 0xff3366 },
+  decoy: { label: 'Decoy Flare', short: 'DECOY', desc: 'Deploys a mirror jet to lure away homing rockets.', duration: 6, color: 0x38bdf8 },
 };
 const POWERUP_TYPES = Object.keys(POWERUPS);
 

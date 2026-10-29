@@ -663,6 +663,24 @@ export class Pickup {
         this.symbol.add(skirt);
         break;
       }
+      case 'mine': {
+        const m = new THREE.Mesh(geo('pkMine', () => new THREE.IcosahedronGeometry(1.5, 0)), this.symbolMat);
+        this.symbol.add(m);
+        const spGeo = geo('pkMineSp', () => { const g = new THREE.ConeGeometry(0.4, 1.2, 4); g.rotateX(Math.PI / 2); return g; });
+        for (const [x, y, z] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+          const sp = new THREE.Mesh(spGeo, this.symbolMat);
+          sp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(x, y, z));
+          sp.position.set(x * 1.3, y * 1.3, z * 1.3);
+          this.symbol.add(sp);
+        }
+        break;
+      }
+      case 'decoy': {
+        const fuselage = new THREE.Mesh(geo('pkDecoyFus', () => { const g = new THREE.ConeGeometry(0.9, 2.8, 4); g.rotateX(Math.PI / 2); return g; }), this.symbolMat);
+        const wings = new THREE.Mesh(geo('pkDecoyWing', () => new THREE.BoxGeometry(3.0, 0.15, 1.2)), this.symbolMat);
+        this.symbol.add(fuselage, wings);
+        break;
+      }
       default: {
         // x2: a pair of spinning diamonds
         for (const sx of [-1.3, 1.3]) {
@@ -711,5 +729,50 @@ export class Pickup {
     this.coreMat.dispose();
     this.symbolMat.dispose();
     this.ringMat.dispose();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sky Mine: hovering proximity mine with pulsing warning spikes
+// ---------------------------------------------------------------------------
+export class Mine {
+  constructor() {
+    this.group = new THREE.Group();
+    this.mat = new THREE.MeshStandardMaterial({
+      color: 0xff3366,
+      emissive: 0xff2244,
+      emissiveIntensity: 2.2,
+      roughness: 0.3,
+      metalness: 0.2,
+      flatShading: true,
+    });
+    const core = new THREE.Mesh(geo('mineBody', () => new THREE.IcosahedronGeometry(2.0, 1)), this.mat);
+    this.group.add(core);
+    const spikeGeo = geo('mineSpike', () => {
+      const g = new THREE.ConeGeometry(0.6, 1.5, 4);
+      g.rotateX(Math.PI / 2);
+      return g;
+    });
+    for (const [x, y, z] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      const sp = new THREE.Mesh(spikeGeo, this.mat);
+      sp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(x, y, z));
+      sp.position.set(x * 1.6, y * 1.6, z * 1.6);
+      this.group.add(sp);
+    }
+  }
+
+  setPosition(x, y, z) {
+    this.group.position.set(x, y, z);
+  }
+
+  update(dt, t, armed) {
+    this.group.rotation.x += dt * (armed ? 2.5 : 0.8);
+    this.group.rotation.y += dt * (armed ? 3.0 : 1.0);
+    const pulse = armed ? 3.2 + Math.sin(t * 12) * 2.0 : 1.4 + Math.sin(t * 3) * 0.6;
+    this.mat.emissiveIntensity = pulse;
+  }
+
+  dispose() {
+    this.mat.dispose();
   }
 }

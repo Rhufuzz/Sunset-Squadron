@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { Graphics, PRESETS } from './graphics.js';
 import { World, islandCollision, WATER_LEVEL, WORLD_RADIUS, CEILING } from './world.js';
-import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
+import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
 import { Controls } from './controls.js';
 import { SoundEngine } from './audio.js';
 import { PILOTS, PERKS, POWERUPS, pilotById, perkMultipliers, hexCss } from './pilots-data.js';
@@ -145,6 +145,8 @@ const remote = new Map();   // id -> { jet, pos, quat, spd, info, lastAt, forwar
 const rockets = new Map();  // id -> { mesh: Rocket, pos, dir, lastAt }
 const balloons = new Map(); // id -> { mesh: Balloon, alive }
 const pickups = new Map();  // id -> { mesh: Pickup, alive, type }
+const mines = new Map();    // id -> { mesh: Mine, pos: Vector3 }
+const decoys = new Map();   // id -> { jet: Jet, pos: Vector3, quat: Quaternion, lastAt: number }
 let crown = null;
 let ribbon = null;
 let raceGates = [];        // race mode: [{ group, mat, haloMat, pos }] per course gate
@@ -486,6 +488,22 @@ function connectSocket() {
   socket.on('pickupSpawn', (e) => spawnPickupMesh(e));
   socket.on('fxEnd', (e) => onFxEnd(e));
   socket.on('shieldBreak', (e) => onShieldBreak(e));
+  socket.on('mineDrop', (e) => {
+    const d = distToMe(e.p);
+    sound.mineDeploy(volumeForDistance(d) * (e.owner === game.myId ? 1 : 0.6));
+    if (e.owner === game.myId) addFeed('Sky mine armed and deployed!');
+  });
+  socket.on('decoySpawn', (e) => {
+    const d = distToMe(e.p);
+    sound.decoyDeploy(volumeForDistance(d) * (e.owner === game.myId ? 1 : 0.6));
+    if (e.owner === game.myId) addFeed('Decoy flare launched!');
+  });
+  socket.on('decoyHit', (e) => {
+    const p = arrToV(e.p);
+    gfx.particles.burst(p, 30, 22, { colors: FIREWORK_PALETTES[1], life: 1.0, size: 2.0 });
+    sound.fireworkPop(volumeForDistance(p.distanceTo(me.pos)) * 0.7);
+    if (e.by === game.myId) addFeed('Rocket destroyed an enemy decoy!');
+  });
 }
 
 function doJoin() {
@@ -531,6 +549,10 @@ function clearRoundEntities() {
   balloons.clear();
   for (const k of pickups.values()) { gfx.scene.remove(k.mesh.group); k.mesh.dispose(); }
   pickups.clear();
+  for (const m of mines.values()) { gfx.scene.remove(m.mesh.group); m.mesh.dispose(); }
+  mines.clear();
+  for (const d of decoys.values()) { gfx.scene.remove(d.jet.group); d.jet.dispose(); }
+  decoys.clear();
   if (crown) { gfx.scene.remove(crown.group); crown = null; }
   if (ribbon) { gfx.scene.remove(ribbon.mesh); ribbon = null; }
   for (const g of raceGates) { gfx.scene.remove(g.group); g.mat.dispose(); g.haloMat.dispose(); }
@@ -814,6 +836,48 @@ function onSnapshot(snap) {
       if (k && k.alive !== Boolean(alive)) { k.alive = Boolean(alive); k.mesh.group.visible = k.alive; }
     });
   }
+  // Sky Mines
+  const seenM = new Set();
+  for (const mk of (snap.mines || [])) {
+    seenM.add(mk.id);
+    let m = mines.get(mk.id);
+    if (!m) {
+      const mesh = new Mine();
+      mesh.setPosition(mk.p[0], mk.p[1], mk.p[2]);
+      gfx.scene.add(mesh.group);
+      m = { mesh, pos: new THREE.Vector3(mk.p[0], mk.p[1], mk.p[2]) };
+      mines.set(mk.id, m);
+    }
+    m.pos.set(mk.p[0], mk.p[1], mk.p[2]);
+    m.mesh.setPosition(mk.p[0], mk.p[1], mk.p[2]);
+    m.mesh.update(0.05, t, mk.arm === 1);
+  }
+  for (const [id, m] of mines) {
+    if (!seenM.has(id)) { gfx.scene.remove(m.mesh.group); m.mesh.dispose(); mines.delete(id); }
+  }
+  // Decoys
+  const seenD = new Set();
+  for (const dk of (snap.decoys || [])) {
+    seenD.add(dk.id);
+    let d = decoys.get(dk.id);
+    if (!d) {
+      const pInfo = pilotById(dk.pilot);
+      const jet = new Jet(pInfo, 'DECOY', portraitCanvas(pInfo, 64));
+      jet.group.position.set(dk.p[0], dk.p[1], dk.p[2]);
+      jet.group.quaternion.set(dk.q[0], dk.q[1], dk.q[2], dk.q[3]);
+      gfx.scene.add(jet.group);
+      d = { jet, pos: new THREE.Vector3(), quat: new THREE.Quaternion(), lastAt: t };
+      decoys.set(dk.id, d);
+    }
+    d.pos.set(dk.p[0], dk.p[1], dk.p[2]);
+    d.quat.set(dk.q[0], dk.q[1], dk.q[2], dk.q[3]);
+    d.jet.group.position.lerp(d.pos, 0.45);
+    d.jet.group.quaternion.slerp(d.quat, 0.45);
+    d.jet.updateVisual(0.05, { boost: true, super: false, invuln: false, tumble: 0, fx: {} }, gfx.particles, t);
+  }
+  for (const [id, d] of decoys) {
+    if (!seenD.has(id)) { gfx.scene.remove(d.jet.group); d.jet.dispose(); decoys.delete(id); }
+  }
   // Crown + ribbon
   if (crown) {
     if (!snap.crownHolderId) crown.group.position.lerp(arrToV(snap.crownPos), 0.5);
@@ -840,12 +904,16 @@ function onHit(e) {
   if (e.victim === game.myId) {
     me.tumble = 0.6;
     gfx.addShake(0.9);
-    addFeed(e.crownStolen ? `${nameOf(e.shooter)} stole your crown!` : `${nameOf(e.shooter)} tagged you with a firework!`);
+    if (e.mine) addFeed(`${nameOf(e.shooter)}'s sky mine hit you!`);
+    else addFeed(e.crownStolen ? `${nameOf(e.shooter)} stole your crown!` : `${nameOf(e.shooter)} tagged you with a firework!`);
   } else if (e.shooter === game.myId) {
-    addFeed(e.crownStolen ? `You stole the crown from ${nameOf(e.victim)}!` : `Direct hit on ${nameOf(e.victim)}!`);
+    if (e.mine) addFeed(`Your sky mine struck ${nameOf(e.victim)}!`);
+    else addFeed(e.crownStolen ? `You stole the crown from ${nameOf(e.victim)}!` : `Direct hit on ${nameOf(e.victim)}!`);
     if (game.mode === 'blitz') showBanner('+5');
   } else if (e.crownStolen) {
-    addFeed(`${nameOf(e.shooter)} ${e.ribbon ? 'flew through the ribbon and' : ''} stole the crown from ${nameOf(e.victim)}`);
+    addFeed(`${nameOf(e.shooter)} ${e.ribbon ? 'flew through the ribbon and' : e.mine ? 'used a mine to' : ''} stole the crown from ${nameOf(e.victim)}`);
+  } else if (e.mine) {
+    addFeed(`${nameOf(e.victim)} hit ${nameOf(e.shooter)}'s sky mine`);
   }
 }
 
@@ -1020,6 +1088,8 @@ const PU_SVG = {
   magnet: '<svg viewBox="0 0 32 32"><path d="M8 4 V16 A8 8 0 0 0 24 16 V4" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="butt"/><rect x="5" y="3" width="6" height="7" fill="#ff5e5b"/><rect x="21" y="3" width="6" height="7" fill="#ff5e5b"/></svg>',
   ghost: '<svg viewBox="0 0 32 32"><path d="M6 29 V15 A10 10 0 0 1 26 15 V29 L22 25 L18 29 L14 25 L10 29 Z" fill="currentColor" opacity="0.85"/><circle cx="12" cy="15" r="2" fill="#1a1030"/><circle cx="20" cy="15" r="2" fill="#1a1030"/></svg>',
   x2: '<svg viewBox="0 0 32 32"><text x="16" y="23" text-anchor="middle" font-size="20" font-weight="900" font-family="system-ui, sans-serif" fill="currentColor">x2</text></svg>',
+  mine: '<svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="6" fill="currentColor"/><path d="M16 4 V9 M16 23 V28 M4 16 H9 M23 16 H28 M7 7 L11 11 M21 21 L25 25 M7 25 L11 21 M21 11 L25 7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>',
+  decoy: '<svg viewBox="0 0 32 32"><path d="M16 4 L27 24 L16 20 L5 24 Z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/><path d="M16 10 L22 21 L16 19 L10 21 Z" fill="currentColor" opacity="0.6"/></svg>',
 };
 let puHtml = '';
 function updatePowerupHud() {
@@ -1294,7 +1364,7 @@ async function boot() {
   document.addEventListener('visibilitychange', () => { if (!document.hidden) sound.resume(); });
   window.addEventListener('pointerdown', () => sound.resume(), { passive: true });
   requestAnimationFrame(frame);
-  window.__sunset = { game, me, remote, rockets, balloons, pickups, gfx, controls, PILOTS, POWERUPS, get world() { return world; }, get socket() { return socket; } };
+  window.__sunset = { game, me, remote, rockets, balloons, pickups, mines, decoys, gfx, controls, PILOTS, POWERUPS, get world() { return world; }, get socket() { return socket; } };
 }
 
 boot();

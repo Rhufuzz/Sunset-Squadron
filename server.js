@@ -288,6 +288,10 @@ const state = {
   joinOrder: [],
   rockets: [],
   rocketSeq: 1,
+  mines: [],
+  mineSeq: 1,
+  decoys: [],
+  decoySeq: 1,
   crown: { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] },
   balloons: [],
   pickups: [],
@@ -417,6 +421,38 @@ function collectPickup(k, p, t) {
   if (k.type === 'ghost') {
     // Rockets already homing in lose their lock
     for (const r of state.rockets) if (r.target === p.id && r.targetKind === 'player') r.target = null;
+  } else if (k.type === 'mine') {
+    // Drop an armed proximity mine behind your jet
+    const dir = forwardFromYP(p.yaw, p.pitch);
+    const dropPos = vsub(p.pos, vscale(dir, 10));
+    const mine = { id: state.mineSeq++, owner: p.id, p: dropPos, born: t, armAt: t + 1.0, alive: true };
+    state.mines.push(mine);
+    io.emit('mineDrop', { id: mine.id, owner: mine.owner, p: [r2(mine.p.x), r2(mine.p.y), r2(mine.p.z)] });
+  } else if (k.type === 'decoy') {
+    // Spawn a mirror jet that flies a straight line for 6s
+    const dir = forwardFromYP(p.yaw, p.pitch);
+    const spawnPos = vadd(p.pos, vscale(dir, 5));
+    const decoy = {
+      id: state.decoySeq++,
+      owner: p.id,
+      pilot: p.pilot,
+      p: spawnPos,
+      dir,
+      quat: { ...p.quat },
+      speed: Math.max(p.speed, SPEED_BASE),
+      born: t,
+      expiresAt: t + dur,
+      alive: true,
+    };
+    state.decoys.push(decoy);
+    io.emit('decoySpawn', {
+      id: decoy.id,
+      owner: decoy.owner,
+      pilot: decoy.pilot,
+      p: [r2(decoy.p.x), r2(decoy.p.y), r2(decoy.p.z)],
+      q: [r3(decoy.quat.x), r3(decoy.quat.y), r3(decoy.quat.z), r3(decoy.quat.w)],
+      spd: r2(decoy.speed),
+    });
   }
   io.emit('pickup', { id: k.id, type: k.type, by: p.id, p: [r2(k.x), r2(k.y), r2(k.z)], dur: r2(dur) });
 }
@@ -755,6 +791,8 @@ function startRound() {
   const all = [...state.players.values()];
   all.forEach((p, i) => spawnPlayer(p, i, all.length));
   state.rockets = [];
+  state.mines = [];
+  state.decoys = [];
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
   state.race = state.settings.mode === 'race' ? { course: generateCourse(state.seed, state.layout), finishCount: 0 } : null;
   state.balloons = state.layout.balloons.map((b) => ({ id: b.id, x: b.x, y: b.y, z: b.z, tint: b.tint, alive: true, respawnAt: 0 }));
@@ -820,6 +858,8 @@ function returnToLobby() {
   for (const b of bots()) state.players.delete(b.id);
   removeAllGone();
   state.rockets = [];
+  state.mines = [];
+  state.decoys = [];
   state.pickups = [];
   state.race = null;
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
@@ -1018,6 +1058,10 @@ function findHomingTarget(r, t) {
     if (hasFx(p, 'ghost', t)) continue;   // Ghost: invisible to homing
     consider(p.pos, p.id, 'player');
   }
+  for (const dec of state.decoys) {
+    if (dec.owner === r.owner) continue;
+    consider(dec.p, dec.id, 'decoy');
+  }
   if (state.settings.mode === 'blitz') {
     for (const b of state.balloons) if (b.alive) consider(b, b.id, 'balloon');
   }
@@ -1031,10 +1075,29 @@ function stepRockets(dt, t) {
     if (!r.target) {
       const tg = findHomingTarget(r, t);
       if (tg) { r.target = tg.id; r.targetKind = tg.kind; }
+    } else if (r.targetKind !== 'decoy') {
+      // Retarget to decoy if an enemy decoy is closer and within homing cone
+      let curD = HOMING_RANGE * 2;
+      if (r.targetKind === 'player') { const tp = state.players.get(r.target); if (tp) curD = dist(tp.pos, r.p); }
+      else if (r.targetKind === 'balloon') { const b = state.balloons[r.target]; if (b) curD = dist(b, r.p); }
+      for (const dec of state.decoys) {
+        if (dec.owner === r.owner) continue;
+        const dd = dist(dec.p, r.p);
+        if (dd < curD) {
+          const toD = vnorm(vsub(dec.p, r.p));
+          const cosAD = clamp(vdot(r.d, toD), -1, 1);
+          if (Math.acos(cosAD) < HOMING_CONE) {
+            r.target = dec.id;
+            r.targetKind = 'decoy';
+            curD = dd;
+          }
+        }
+      }
     }
     if (r.target) {
       let tpos = null;
       if (r.targetKind === 'player') { const tp = state.players.get(r.target); tpos = tp ? tp.pos : null; }
+      else if (r.targetKind === 'decoy') { const dec = state.decoys.find((d) => d.id === r.target); tpos = dec ? dec.p : null; }
       else { const b = state.balloons[r.target]; tpos = b && b.alive ? b : null; }
       if (!tpos) { r.target = null; }
       else {
@@ -1089,6 +1152,19 @@ function stepRockets(dt, t) {
         break;
       }
     }
+    // Decoy collision: any rocket hit destroys the decoy
+    if (!dead) {
+      for (const dec of state.decoys) {
+        if (dec.owner === r.owner) continue;
+        if (dist(dec.p, r.p) < 12) {
+          dead = true;
+          dec.expiresAt = 0; // expires immediately
+          io.emit('boom', { p: [r2(dec.p.x), r2(dec.p.y), r2(dec.p.z)] });
+          io.emit('decoyHit', { id: dec.id, by: r.owner, p: [r2(dec.p.x), r2(dec.p.y), r2(dec.p.z)] });
+          break;
+        }
+      }
+    }
     if (!dead && state.settings.mode === 'blitz') {
       for (const b of state.balloons) {
         if (!b.alive) continue;
@@ -1106,6 +1182,53 @@ function stepRockets(dt, t) {
     if (!dead) alive.push(r);
   }
   state.rockets = alive;
+}
+
+function stepMines(dt, t) {
+  const alive = [];
+  for (const m of state.mines) {
+    if (t - m.born > 25) continue;
+    let dead = false;
+    if (t >= m.armAt) {
+      for (const p of state.players.values()) {
+        if (p.id === m.owner || p.gone) continue;
+        const d = dist(m.p, p.pos);
+        if (d < 14 && t >= p.invulnUntil && !(t < p.rollingUntil)) {
+          dead = true;
+          const miner = state.players.get(m.owner);
+          if (hasFx(p, 'shield', t)) {
+            delete p.fx.shield;
+            io.emit('shieldBreak', { id: p.id, by: m.owner, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] });
+          } else {
+            p.tumbleUntil = t + TUMBLE_TIME * p.perk.tumble;
+            let crownStolen = false;
+            if (miner) miner.stats.hits++;
+            if (state.settings.mode === 'crown' && state.crown.holderId === p.id && miner) {
+              crownStolen = true;
+              giveCrown(miner.id, 'mine', p.id);
+            } else if (state.settings.mode === 'blitz' && miner) {
+              addScore(miner, 5, t);
+            }
+            io.emit('hit', { shooter: m.owner, victim: p.id, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], crownStolen, mine: true });
+          }
+          io.emit('boom', { p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] });
+          break;
+        }
+      }
+    }
+    if (!dead) alive.push(m);
+  }
+  state.mines = alive;
+}
+
+function stepDecoys(dt, t) {
+  const alive = [];
+  for (const d of state.decoys) {
+    if (t >= d.expiresAt) continue;
+    d.p = vadd(d.p, vscale(d.dir, d.speed * dt));
+    alive.push(d);
+  }
+  state.decoys = alive;
 }
 
 function popBalloon(b, byId, t) {
@@ -1387,6 +1510,18 @@ function stepBot(p, dt, t) {
   if (p.pos.y < 22) goal.y = Math.max(goal.y, p.pos.y + 50);
   if (Math.hypot(p.pos.x, p.pos.z) > WORLD_RADIUS - 100 && !hitAhead) goal = { x: 0, y: 100, z: 0 };
 
+  // Mine avoidance: steer away from any armed mine within ~60m
+  for (const m of state.mines) {
+    if (t < m.armAt) continue;
+    const md = dist(m.p, p.pos);
+    if (md < 60) {
+      const away = vnorm(vsub(p.pos, m.p));
+      goal = vadd(p.pos, vscale(away, 80));
+      if (md < 35 && p.stamina > 0.2) wantBoost = true;
+      break;
+    }
+  }
+
   const to = vnorm(vsub(goal, p.pos));
   const targetYaw = Math.atan2(-to.x, -to.z);
   const targetPitch = clamp(Math.asin(clamp(to.y, -1, 1)), -0.6, 0.6);
@@ -1480,6 +1615,8 @@ function snapshot(t) {
     })),
     pickups: state.pickups.map((k) => (k.alive ? 1 : 0)),
     rockets: state.rockets.map((r) => ({ id: r.id, o: r.owner, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], d: [r3(r.d.x), r3(r.d.y), r3(r.d.z)] })),
+    mines: state.mines.map((m) => ({ id: m.id, o: m.owner, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], arm: t >= m.armAt ? 1 : 0 })),
+    decoys: state.decoys.map((d) => ({ id: d.id, o: d.owner, pilot: d.pilot, p: [r2(d.p.x), r2(d.p.y), r2(d.p.z)], q: [r3(d.quat.x), r3(d.quat.y), r3(d.quat.z), r3(d.quat.w)], spd: r2(d.speed) })),
     balloons: state.settings.mode === 'blitz' ? state.balloons.map((b) => (b.alive ? 1 : 0)) : [],
   };
 }
@@ -1491,6 +1628,8 @@ function tick() {
   if (state.phase === 'playing') {
     for (const b of bots()) stepBot(b, dt, t);
     stepRockets(dt, t);
+    stepMines(dt, t);
+    stepDecoys(dt, t);
     stepCrown(dt, t);
     stepGatesAndPickups(t);
     stepBalloons(t);

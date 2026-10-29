@@ -319,13 +319,13 @@ export class SoundEngine {
   pickup(type = 'turbo', volume = 1) {
     if (!this.ctx || this.muted) return;
     const ctx = this.ctx, t = ctx.currentTime;
-    const bases = { turbo: 440, shield: 392, rapid: 523.25, magnet: 349.23, ghost: 311.13, x2: 587.33 };
+    const bases = { turbo: 440, shield: 392, rapid: 523.25, magnet: 349.23, ghost: 311.13, x2: 587.33, mine: 329.63, decoy: 493.88 };
     const base = bases[type] || 440;
-    const ratios = type === 'ghost' ? [1, 1.189, 1.414, 1.682] : [1, 1.25, 1.5, 2];
+    const ratios = type === 'ghost' ? [1, 1.189, 1.414, 1.682] : type === 'mine' ? [1, 0.9, 1.2, 0.8] : [1, 1.25, 1.5, 2];
     ratios.forEach((r, i) => {
       const st = t + i * 0.06;
       const o = ctx.createOscillator();
-      o.type = type === 'shield' ? 'sine' : 'triangle';
+      o.type = type === 'shield' ? 'sine' : type === 'mine' ? 'sawtooth' : 'triangle';
       o.frequency.value = base * r;
       const g = ctx.createGain();
       this._env(g, st, 0.16 * volume, 0.008, 0.35);
@@ -344,6 +344,57 @@ export class SoundEngine {
     shimmer.connect(bp).connect(sg).connect(this.master);
     shimmer.start(t);
     shimmer.stop(t + 0.4);
+  }
+
+  /** Sky mine deployed behind jet: low mechanical release and armed beep. */
+  mineDeploy(volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    o.type = 'square';
+    o.frequency.setValueAtTime(260, t);
+    o.frequency.exponentialRampToValueAtTime(140, t + 0.15);
+    const g = ctx.createGain();
+    this._env(g, t, 0.18 * volume, 0.005, 0.18);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + 0.2);
+    // Short arming chirp
+    const chirp = ctx.createOscillator();
+    chirp.type = 'sine';
+    chirp.frequency.setValueAtTime(880, t + 0.12);
+    chirp.frequency.setValueAtTime(1174, t + 0.18);
+    const cg = ctx.createGain();
+    this._env(cg, t + 0.12, 0.12 * volume, 0.003, 0.12);
+    chirp.connect(cg).connect(this.master);
+    chirp.start(t + 0.12);
+    chirp.stop(t + 0.25);
+  }
+
+  /** Decoy deployed: jet launch flare swoosh. */
+  decoyDeploy(volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const n = this._noiseSource(false);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(600, t);
+    bp.frequency.exponentialRampToValueAtTime(2800, t + 0.25);
+    bp.Q.value = 2.5;
+    const ng = ctx.createGain();
+    this._env(ng, t, 0.2 * volume, 0.01, 0.3);
+    n.connect(bp).connect(ng).connect(this.master);
+    n.start(t);
+    n.stop(t + 0.35);
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(440, t);
+    o.frequency.exponentialRampToValueAtTime(880, t + 0.2);
+    const g = ctx.createGain();
+    this._env(g, t, 0.14 * volume, 0.005, 0.25);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + 0.3);
   }
 
   /** Power-up ran out: soft two-note descending "power down". */
