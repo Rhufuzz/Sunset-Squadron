@@ -59,10 +59,16 @@ const TURBO_SPEED = 95;
 const ROCKET_COOLDOWN_RAPID = 0.4;
 const MAGNET_MULT = 2.2;             // Magnet power-up range multiplier
 
+const RACE_GATES = 10;               // Checkpoint Race: gates per course
+const RACE_FINISH_BASE = 100;        // 1st place points
+const RACE_FINISH_STEP = 15;         // points lost per rank
+const RACE_FINISH_MIN = 25;          // floor for finish points
+const RACE_GATE_R = 11;              // course gate ring radius (slightly bigger than blitz gates)
+
 const BOT_NAMES = ['Wingman Ace', 'Wingman Duke', 'Wingman Pip', 'Wingman Zed'];
 const leaderboard = new Leaderboard();
 const PRESETS = ['sunset', 'noon', 'twilight'];
-const MODES = ['crown', 'blitz'];
+const MODES = ['crown', 'blitz', 'race'];
 
 // ---------------------------------------------------------------------------
 // Shared deterministic world layout (identical code lives in public/js/world.js)
@@ -155,6 +161,72 @@ function generateLayout(seed) {
   return { seed, islands, arches, balloons, clouds };
 }
 
+/**
+ * Checkpoint Race course: RACE_GATES ring gates forming an open loop inside
+ * WORLD_RADIUS, spaced 120-250m apart, at varied altitudes, each ring facing
+ * along the direction of travel so pilots cross the gate plane flying the loop.
+ * Uses its own stream of the shared seeded PRNG (same seed = same course).
+ */
+function generateCourse(seed, layout) {
+  const rand = mulberry32((seed ^ 0x1f2e3d4c) >>> 0);
+  const gates = [];
+  const maxR = WORLD_RADIUS - 110;
+  const startAng = rand() * Math.PI * 2;
+  const startDist = 200 + rand() * 200;
+  let x = Math.cos(startAng) * startDist;
+  let z = Math.sin(startAng) * startDist;
+  let y = 55 + rand() * 45;
+  let dir = startAng + Math.PI / 2;          // start heading: tangential, so the loop circles the archipelago
+  for (let i = 0; i < RACE_GATES; i++) {
+    // Nudge the gate out of any island ellipsoid (same trick as arch placement)
+    for (const isl of layout.islands) {
+      const dx = x - isl.x, dz = z - isl.z;
+      const d = Math.hypot(dx, dz);
+      if (d < isl.rx + 30) {
+        const k = (isl.rx + 30) / Math.max(d, 1);
+        x = isl.x + dx * k;
+        z = isl.z + dz * k;
+      }
+    }
+    // Ring normal (sin yaw, cos yaw) aligned with the travel direction so the loop flies through it
+    const yaw = Math.atan2(Math.cos(dir), Math.sin(dir));
+    gates.push({ id: i, x, y, z, yaw, r: 16, gateR: RACE_GATE_R, hue: 0 });
+    // Advance along the loop: gentle mostly-one-way curves keep it an open circuit
+    const step = 130 + rand() * 110;         // 130-240m spacing (within the 120-250m brief)
+    dir += (0.15 + rand() * 0.5) * (rand() < 0.82 ? 1 : -1);
+    let nx = x + Math.cos(dir) * step;
+    let nz = z + Math.sin(dir) * step;
+    if (Math.hypot(nx, nz) > maxR) {
+      // Steer back toward the centre before leaving the world
+      dir = Math.atan2(-nz, -nx) + (rand() - 0.5) * 0.9;
+      nx = x + Math.cos(dir) * step;
+      nz = z + Math.sin(dir) * step;
+    }
+    // Keep the true gate-to-gate distance inside 125-245m even after island push-out
+    for (let tries = 0; tries < 3; tries++) {
+      for (const isl of layout.islands) {
+        const dx = nx - isl.x, dz = nz - isl.z;
+        const d = Math.hypot(dx, dz);
+        if (d < isl.rx + 30) {
+          const k = (isl.rx + 30) / Math.max(d, 1);
+          nx = isl.x + dx * k;
+          nz = isl.z + dz * k;
+        }
+      }
+      const dx = nx - x, dz = nz - z;
+      const d = Math.hypot(dx, dz);
+      if (d < 125 || d > 245) {
+        const target = d < 125 ? 125 + rand() * 25 : 220 + rand() * 25;
+        nx = x + (dx / d) * target;
+        nz = z + (dz / d) * target;
+      } else break;
+    }
+    x = nx; z = nz;
+    y = clamp(y + (rand() - 0.5) * 80, 40, 175);
+  }
+  return gates;
+}
+
 // ---------------------------------------------------------------------------
 // Small vector / orientation helpers (match THREE Euler order 'YXZ')
 // ---------------------------------------------------------------------------
@@ -219,6 +291,7 @@ const state = {
   crown: { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] },
   balloons: [],
   pickups: [],
+  race: null,                   // race mode: { course: [...gates], finishCount }
   roundEndsAt: 0,
   endedAt: 0,
   lastResults: null,
@@ -252,6 +325,7 @@ function makePlayer(id, name, pilot, isBot) {
     goneAt: 0,
     gateSide: {},
     gateCooldown: {},
+    race: { gateIndex: 0, gatesPassed: 0, finished: false, finishRank: 0, finishTime: 0 },
     joy: { x: 0, y: 0 },
     bot: null,
   };
@@ -276,6 +350,7 @@ function spawnPlayer(p, index, total) {
   p.lastFire = 0;
   p.gateSide = {};
   p.gateCooldown = {};
+  p.race = { gateIndex: 0, gatesPassed: 0, finished: false, finishRank: 0, finishTime: 0 };
   p.stamina = 1;
   p.fx = {};
   p.stats = { balloons: 0, hits: 0, crownTime: 0, pickups: 0 };
@@ -285,9 +360,11 @@ function spawnPlayer(p, index, total) {
 function respawnPlayer(p, index, total) {
   const keepScore = p.score;
   const keepStats = p.stats;
+  const keepRace = p.race;
   spawnPlayer(p, index, total);
   p.score = keepScore;
   p.stats = keepStats;
+  p.race = keepRace;            // reconnecting mid-race resumes at their next gate
   p.invulnUntil = now() + 3;    // brief spawn protection so they aren't instantly shot
 }
 
@@ -650,6 +727,7 @@ function roundStartPayload() {
     balloons: state.balloons.map((b) => ({ id: b.id, x: r2(b.x), y: r2(b.y), z: r2(b.z), alive: b.alive, tint: b.tint })),
     crown: { holderId: state.crown.holderId, pos: state.crown.pos },
     pickups: state.pickups.map(pickupPublic),
+    course: state.race ? { gates: state.race.course.map((g) => ({ id: g.id, x: r2(g.x), y: r2(g.y), z: r2(g.z), yaw: r3(g.yaw), gateR: g.gateR })), total: state.race.course.length } : null,
     players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, pos: p.pos, yaw: p.yaw })),
   };
 }
@@ -678,6 +756,7 @@ function startRound() {
   all.forEach((p, i) => spawnPlayer(p, i, all.length));
   state.rockets = [];
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
+  state.race = state.settings.mode === 'race' ? { course: generateCourse(state.seed, state.layout), finishCount: 0 } : null;
   state.balloons = state.layout.balloons.map((b) => ({ id: b.id, x: b.x, y: b.y, z: b.z, tint: b.tint, alive: true, respawnAt: 0 }));
   spawnPickups();
   state.phase = 'playing';
@@ -693,13 +772,32 @@ function endRound() {
   state.phase = 'ended';
   state.endedAt = Date.now();
   const mode = state.settings.mode;
+  const isRace = mode === 'race';
   const results = [...state.players.values()]
     .map((p) => ({
       id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, score: Math.round(p.score),
       stats: { balloons: p.stats.balloons, hits: p.stats.hits, crownTime: Math.round(p.stats.crownTime), pickups: p.stats.pickups },
+      race: {
+        finished: p.race.finished, finishRank: p.race.finishRank, finishTime: p.race.finishTime,
+        gatesPassed: p.race.gatesPassed, total: state.race ? state.race.course.length : RACE_GATES,
+      },
       newBests: [],
-    }))
-    .sort((a, b) => b.score - a.score);
+    }));
+  if (isRace) {
+    // Finish order first, then gates passed, then fewest seconds for tied finishers
+    results.sort((a, b) => {
+      const fa = a.race.finished ? 0 : 1, fb = b.race.finished ? 0 : 1;
+      if (fa !== fb) return fa - fb;
+      if (a.race.finished && b.race.finished) {
+        if (a.race.finishRank !== b.race.finishRank) return a.race.finishRank - b.race.finishRank;
+        return a.race.finishTime - b.race.finishTime;
+      }
+      if (b.race.gatesPassed !== a.race.gatesPassed) return b.race.gatesPassed - a.race.gatesPassed;
+      return b.score - a.score;
+    });
+  } else {
+    results.sort((a, b) => b.score - a.score);
+  }
   const winnerId = results.length ? results[0].id : null;
   // Humans only on the persistent leaderboard
   const humanRows = results.filter((r) => !r.isBot).map((r) => ({
@@ -723,6 +821,7 @@ function returnToLobby() {
   removeAllGone();
   state.rockets = [];
   state.pickups = [];
+  state.race = null;
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
   broadcastLobby();
 }
@@ -848,6 +947,7 @@ io.on('connection', (socket) => {
 
   socket.on('fire', () => {
     if (!player || state.phase !== 'playing') return;
+    if (state.settings.mode === 'race') return;   // no fireworks on the race course
     tryFire(player);
   });
 
@@ -868,6 +968,7 @@ io.on('connection', (socket) => {
 // Rockets, crown, balloons, gates
 // ---------------------------------------------------------------------------
 function tryFire(p) {
+  if (state.settings.mode === 'race') return false;   // fireworks are off during Checkpoint Race
   const t = now();
   let cd = t < p.superUntil ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
   if (hasFx(p, 'rapid', t)) cd = Math.min(cd, ROCKET_COOLDOWN_RAPID);
@@ -1025,15 +1126,54 @@ function stepBalloons(t) {
   }
 }
 
+function raceGateFor(p) {
+  if (!state.race || p.race.finished) return null;
+  return state.race.course[p.race.gateIndex] || null;
+}
+
+/** Checkpoint Race: detect crossing the current gate's plane inside the ring. */
+function stepRaceGate(p, t) {
+  const a = raceGateFor(p);
+  if (!a) return;
+  const rel = { x: p.pos.x - a.x, y: p.pos.y - a.y, z: p.pos.z - a.z };
+  const nx = Math.sin(a.yaw), nz = Math.cos(a.yaw);
+  const along = rel.x * nx + rel.z * nz;
+  const lateral = Math.hypot(rel.x * nz - rel.z * nx, rel.y);
+  const side = along >= 0 ? 1 : -1;
+  const prev = p.gateSide[a.id];
+  p.gateSide[a.id] = side;
+  if (prev === undefined || prev === side || Math.abs(along) >= 30 || lateral >= a.gateR + 1.5) return;
+  if (p.gateCooldown[a.id] > t) return;
+  p.gateCooldown[a.id] = t + 3;
+  p.race.gatesPassed++;
+  const total = state.race.course.length;
+  const isFinal = p.race.gateIndex >= total - 1;
+  if (!isFinal) {
+    p.race.gateIndex++;
+    io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)], race: true, gi: p.race.gateIndex, total });
+  } else {
+    p.race.finished = true;
+    p.race.finishRank = ++state.race.finishCount;
+    p.race.finishTime = r2(Math.max(0, ROUND_SECONDS - Math.max(0, (state.roundEndsAt - Date.now()) / 1000)));
+    const pts = Math.max(RACE_FINISH_MIN, RACE_FINISH_BASE - RACE_FINISH_STEP * (p.race.finishRank - 1));
+    addScore(p, pts, t);
+    io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)], race: true, gi: total, total });
+    io.emit('finish', { id: p.id, rank: p.race.finishRank, points: pts, time: p.race.finishTime, p: [r2(a.x), r2(a.y), r2(a.z)] });
+    console.log(`[race] ${p.name} finished ${p.race.finishRank}${p.race.finishRank === 1 ? 'st' : p.race.finishRank === 2 ? 'nd' : p.race.finishRank === 3 ? 'rd' : 'th'} (+${pts})`);
+  }
+}
+
 function stepGatesAndPickups(t) {
   const mode = state.settings.mode;
   for (const p of state.players.values()) {
-    // Power-up orbs (both modes)
+    // Power-up orbs (all modes)
     const pickR = reach(p, PICKUP_RADIUS, t);
     for (const k of state.pickups) {
       if (k.alive && dist(k, p.pos) < pickR) collectPickup(k, p, t);
     }
-    if (mode === 'blitz') {
+    if (mode === 'race') {
+      stepRaceGate(p, t);
+    } else if (mode === 'blitz') {
       // Balloons popped by flying straight into them
       const balloonR = reach(p, 9, t);
       for (const b of state.balloons) {
@@ -1132,6 +1272,10 @@ function stepBot(p, dt, t) {
       } else {
         bs.targetId = 'crown';
       }
+    } else if (mode === 'race') {
+      // Course is computed per-frame below; retargeting is only used for pickups (skipped while racing)
+      bs.target = null;
+      bs.targetId = 'race';
     } else {
       // Blitz: nearest balloon, or occasionally an arch for the super-charge
       let best = null, bestD = Infinity;
@@ -1155,8 +1299,22 @@ function stepBot(p, dt, t) {
     }
   }
 
+  if (mode === 'race' && !p.race.finished) {
+    // Fly straight at the next course gate's ring centre (free-floating ring, no
+    // stone arch to clip, so a direct seek beats the blitz line-up-then-dive orbit).
+    const g = raceGateFor(p);
+    if (g) {
+      goal = { x: g.x, y: g.y, z: g.z };
+      const gd = dist(g, p.pos);
+      wantBoost = gd > 140 && p.stamina > 0.4;
+    }
+  } else if (mode === 'race') {
+    // Finished: cruise until the round ends
+    bs.wander += dt * 0.3;
+    goal = { x: Math.cos(bs.wander) * 380, y: 100, z: Math.sin(bs.wander) * 380 };
+  }
   const wantedPickup = bs.pickupId !== null ? state.pickups[bs.pickupId] : null;
-  if (wantedPickup && wantedPickup.alive) {
+  if (!goal && wantedPickup && wantedPickup.alive) {
     goal = { x: wantedPickup.x, y: wantedPickup.y, z: wantedPickup.z };
     wantBoost = hasFx(p, 'turbo', t);
   } else if (mode === 'crown') {
@@ -1315,6 +1473,7 @@ function snapshot(t) {
       rl: t < p.rollingUntil ? r2(p.rollingUntil - t) : 0,
       st: r2(p.stamina),
       fx: fxSnapshot(p, t),
+      ...(state.settings.mode === 'race' ? { gi: p.race.gateIndex, gp: p.race.gatesPassed, fin: p.race.finished ? p.race.finishRank : 0 } : {}),
     })),
     pickups: state.pickups.map((k) => (k.alive ? 1 : 0)),
     rockets: state.rockets.map((r) => ({ id: r.id, o: r.owner, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], d: [r3(r.d.x), r3(r.d.y), r3(r.d.z)] })),

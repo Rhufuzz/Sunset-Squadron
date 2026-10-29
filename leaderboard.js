@@ -9,10 +9,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const MODES = ['crown', 'blitz'];
+const MODES = ['crown', 'blitz', 'race'];
 
 function emptyBoard() {
-  return { version: 1, updatedAt: null, modes: { crown: {}, blitz: {} } };
+  return { version: 1, updatedAt: null, modes: { crown: {}, blitz: {}, race: {} } };
 }
 
 function emptyEntry(name, pilot) {
@@ -135,8 +135,12 @@ class Leaderboard {
     return {
       updatedAt: this.board.updatedAt,
       file: path.basename(this.file),
-      modes: { crown: this.top('crown', n), blitz: this.top('blitz', n) },
-      totals: { crown: Object.keys(this.board.modes.crown).length, blitz: Object.keys(this.board.modes.blitz).length },
+      modes: { crown: this.top('crown', n), blitz: this.top('blitz', n), race: this.top('race', n) },
+      totals: {
+        crown: Object.keys(this.board.modes.crown).length,
+        blitz: Object.keys(this.board.modes.blitz).length,
+        race: Object.keys(this.board.modes.race).length,
+      },
     };
   }
 }

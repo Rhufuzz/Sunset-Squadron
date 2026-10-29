@@ -24,7 +24,10 @@ const BARREL_ROLL_TIME = 0.45;
 const STATE_SEND_MS = 50;
 const LERP = 0.25;
 
-const MODE_LABEL = { crown: 'CROWN TAG', blitz: 'ARCH & BALLOON BLITZ' };
+const MODE_LABEL = { crown: 'CROWN TAG', blitz: 'ARCH & BALLOON BLITZ', race: 'CHECKPOINT RACE' };
+const MODE_NAME = { crown: 'Crown Tag', blitz: 'Blitz', race: 'Checkpoint Race' };
+const RACE_GATE_COLOR = 0x4ff1ff;
+const RACE_GATE_ACTIVE = 0xffd54a;
 
 // Stable per-browser client id: lets the server restore our seat (pilot, name,
 // score) if we drop and rejoin while a round is in progress.
@@ -108,6 +111,7 @@ const game = {
   lastSnap: null,
   lastSnapAt: 0,
   crownHolderId: null,
+  course: null,            // race mode: { gates: [...], total }
   names: new Map(),        // id -> { name, pilot, isBot }
   attractAngle: 0,
 };
@@ -125,6 +129,9 @@ const me = {
   invuln: false,
   lastFire: -10,
   score: 0,
+  gi: 0,                   // race: index of the next gate to pass
+  gp: 0,                   // race: gates passed so far
+  fin: 0,                  // race: finish rank once finished (0 = still racing)
   fx: {},                  // active power-ups: type -> seconds remaining (from the server)
   fxAt: 0,
   quat: new THREE.Quaternion(),
@@ -140,6 +147,8 @@ const balloons = new Map(); // id -> { mesh: Balloon, alive }
 const pickups = new Map();  // id -> { mesh: Pickup, alive, type }
 let crown = null;
 let ribbon = null;
+let raceGates = [];        // race mode: [{ group, mat, haloMat, pos }] per course gate
+let raceHiIndex = -1;      // gate index currently highlighted gold
 let lastStateSent = 0;
 const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3(), tmpV3 = new THREE.Vector3();
 const tmpQ = new THREE.Quaternion();
@@ -258,7 +267,7 @@ function renderLeaderboard() {
     const pilot = pilotById(e.pilot);
     const tr = document.createElement('tr');
     if (myName && e.name === myName && e.pilot === game.pilotId) tr.classList.add('mine');
-    const unit = game.lbMode === 'crown' ? `${Math.round(e.totalPoints)}s crown` : `${e.balloons} balloons`;
+    const unit = game.lbMode === 'crown' ? `${Math.round(e.totalPoints)}s crown` : game.lbMode === 'race' ? `${Math.round(e.totalPoints)} pts` : `${e.balloons} balloons`;
     tr.innerHTML = `<td class="num">${e.rank}</td><td></td><td class="num">${e.wins}</td><td class="num">${e.bestScore}</td><td class="num">${e.rounds}</td>`;
     const cell = tr.children[1];
     const wrap = document.createElement('div');
@@ -278,7 +287,7 @@ function renderLeaderboard() {
   }
   if (lb && lb.totals) {
     const n = lb.totals[game.lbMode] || 0;
-    ui.lbHint.textContent = n ? `${n} pilot${n === 1 ? '' : 's'} on the ${game.lbMode === 'crown' ? 'Crown Tag' : 'Blitz'} board · humans only · wins, then best score` : 'Humans only · sorted by wins, then best score';
+    ui.lbHint.textContent = n ? `${n} pilot${n === 1 ? '' : 's'} on the ${MODE_NAME[game.lbMode] || game.lbMode} board · humans only · wins, then best score` : 'Humans only · sorted by wins, then best score';
   }
 }
 
@@ -451,6 +460,7 @@ function connectSocket() {
   socket.on('hit', (e) => onHit(e));
   socket.on('pop', (e) => onPop(e));
   socket.on('gate', (e) => onGate(e));
+  socket.on('finish', (e) => onFinish(e));
   socket.on('crown', (e) => onCrownEvent(e));
   socket.on('roll', (e) => { if (e.id !== game.myId) { const r = remote.get(e.id); if (r) r.rollingUntil = nowS() + BARREL_ROLL_TIME; } });
   socket.on('deflect', (e) => {
@@ -520,6 +530,10 @@ function clearRoundEntities() {
   pickups.clear();
   if (crown) { gfx.scene.remove(crown.group); crown = null; }
   if (ribbon) { gfx.scene.remove(ribbon.mesh); ribbon = null; }
+  for (const g of raceGates) { gfx.scene.remove(g.group); g.mat.dispose(); g.haloMat.dispose(); }
+  raceGates = [];
+  raceHiIndex = -1;
+  game.course = null;
   ui.hudFeed.innerHTML = '';
   ui.hudPowerups.innerHTML = '';
   me.fx = {};
@@ -544,6 +558,45 @@ function buildWorld(seed) {
   world = new World(gfx.scene, seed);
   gfx.attachWorld(world);
   game.seed = seed;
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint Race: course gate meshes + active-gate highlight
+// ---------------------------------------------------------------------------
+function buildRaceGates(course) {
+  for (const g of course.gates) {
+    const group = new THREE.Group();
+    group.position.set(g.x, g.y, g.z);
+    group.rotation.y = g.yaw;
+    const mat = new THREE.MeshStandardMaterial({ color: RACE_GATE_COLOR, emissive: RACE_GATE_COLOR, emissiveIntensity: 2.2, roughness: 0.3, metalness: 0.2, flatShading: true });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(g.gateR, 0.9, 8, 40), mat);
+    const haloMat = new THREE.MeshBasicMaterial({ color: RACE_GATE_COLOR, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false });
+    const halo = new THREE.Mesh(new THREE.CircleGeometry(g.gateR - 0.6, 32), haloMat);
+    group.add(ring, halo);
+    gfx.scene.add(group);
+    raceGates.push({ group, mat, haloMat, pos: new THREE.Vector3(g.x, g.y, g.z) });
+  }
+  raceHiIndex = -1;
+}
+
+/** Gold highlight on your next gate; brighter cyan on the one after. */
+function updateRaceGateHighlight() {
+  if (!game.course || !raceGates.length) return;
+  const gi = game.phase === 'playing' ? clamp(me.gi, 0, raceGates.length - 1) : -1;
+  if (gi === raceHiIndex) return;
+  raceHiIndex = gi;
+  raceGates.forEach((g, i) => {
+    if (i === gi) {
+      g.mat.color.setHex(RACE_GATE_ACTIVE); g.mat.emissive.setHex(RACE_GATE_ACTIVE); g.mat.emissiveIntensity = 4.2;
+      g.haloMat.color.setHex(RACE_GATE_ACTIVE); g.haloMat.opacity = 0.22;
+    } else if (i === gi + 1) {
+      g.mat.color.setHex(RACE_GATE_COLOR); g.mat.emissive.setHex(RACE_GATE_COLOR); g.mat.emissiveIntensity = 3.4;
+      g.haloMat.color.setHex(RACE_GATE_COLOR); g.haloMat.opacity = 0.16;
+    } else {
+      g.mat.color.setHex(RACE_GATE_COLOR); g.mat.emissive.setHex(RACE_GATE_COLOR); g.mat.emissiveIntensity = 1.4;
+      g.haloMat.color.setHex(RACE_GATE_COLOR); g.haloMat.opacity = 0.07;
+    }
+  });
 }
 
 function startRound(data) {
@@ -572,6 +625,7 @@ function startRound(data) {
   else { me.pos.set(0, 90, 260); me.yaw = 0; }
   me.pitch = 0; me.roll = 0; me.speed = SPEED_BASE; me.stamina = 1; me.rollingUntil = 0; me.tumble = 0;
   me.superUntil = 0; me.invuln = false; me.lastFire = -10; me.score = 0; me.fx = {}; me.fxAt = nowS();
+  me.gi = 0; me.gp = 0; me.fin = 0;
   quatFromYPR(me.quat, me.yaw, 0, 0);
   me.jet.group.position.copy(me.pos);
   me.jet.group.quaternion.copy(me.quat);
@@ -598,6 +652,11 @@ function startRound(data) {
       balloons.set(b.id, { mesh, alive: b.alive });
     }
   }
+  // Checkpoint Race course gates
+  if (data.mode === 'race' && data.course && data.course.gates) {
+    game.course = data.course;
+    buildRaceGates(data.course);
+  }
   // Power-up orbs (both modes)
   for (const k of data.pickups || []) spawnPickupMesh(k);
 
@@ -614,11 +673,14 @@ function startRound(data) {
   hp.clearRect(0, 0, ui.hudPortrait.width, ui.hudPortrait.height);
   hp.drawImage(portraitCanvas(myPilot, 128), 0, 0, ui.hudPortrait.width, ui.hudPortrait.height);
   ui.hudScore.textContent = '0';
+  ui.btnFire.classList.toggle('hidden', data.mode === 'race');   // no fireworks on the race course
   controls.setEnabled(true);
   checkOrientation();
-  showBanner(data.mode === 'crown' ? 'CHASE THE CROWN!' : 'POP & DIVE!');
+  showBanner(data.mode === 'crown' ? 'CHASE THE CROWN!' : data.mode === 'race' ? 'RACE THE COURSE!' : 'POP & DIVE!');
   sound.fanfare(0.7);
-  addFeed(data.mode === 'crown' ? 'Grab the Golden Crown: +1 pt every second you hold it' : 'Balloons +10 · Ring gates +25 and SUPER-CHARGE');
+  addFeed(data.mode === 'crown' ? 'Grab the Golden Crown: +1 pt every second you hold it'
+    : data.mode === 'race' ? `Fly through all ${game.course ? game.course.total : 10} gates in order · 1st finish = 100 pts`
+    : 'Balloons +10 · Ring gates +25 and SUPER-CHARGE');
 }
 
 function endRound(results) {
@@ -634,7 +696,11 @@ function endRound(results) {
     const pilot = pilotById(r.pilot);
     const li = document.createElement('li');
     const st = r.stats || {};
-    const statTxt = results.mode === 'crown' ? `${st.crownTime || 0}s crown · ${st.hits || 0} hits` : `${st.balloons || 0} balloons · ${st.hits || 0} hits`;
+    const statTxt = results.mode === 'race'
+      ? (r.race && r.race.finished
+        ? `🏁 ${ordinal(r.race.finishRank)} · ${r.race.finishTime}s · ${r.score} pts`
+        : `${r.race ? `${r.race.gatesPassed}/${r.race.total}` : '0'} gates · ${r.score} pts`)
+      : results.mode === 'crown' ? `${st.crownTime || 0}s crown · ${st.hits || 0} hits` : `${st.balloons || 0} balloons · ${st.hits || 0} hits`;
     li.innerHTML = `<span class="rank">${i + 1}.</span><span class="portrait-slot"></span><span class="nm">${escapeHtml(r.name)}${r.id === game.myId ? ' (you)' : ''}<small>${escapeHtml(pilot.callsign)}${r.isBot ? ' · AI' : ''}</small></span><span class="st">${statTxt}</span><span class="sc">${r.score}</span>`;
     li.querySelector('.portrait-slot').replaceWith(portraitElement(pilot, 30));
     li.querySelector('.nm').style.color = trailCss(pilot);
@@ -687,6 +753,7 @@ function onSnapshot(snap) {
       if (p.tu > 0) me.tumble = Math.max(me.tumble, p.tu);
       me.fx = p.fx || {};
       me.fxAt = t;
+      if (p.gi !== undefined) { me.gi = p.gi; me.gp = p.gp; me.fin = p.fin; }
       continue;
     }
     let r = remote.get(p.id);
@@ -749,6 +816,7 @@ function onSnapshot(snap) {
     if (!snap.crownHolderId) crown.group.position.lerp(arrToV(snap.crownPos), 0.5);
   }
   if (ribbon) ribbon.setPoints(snap.ribbon || [], t);
+  updateRaceGateHighlight();
   updateBoard(snap);
 }
 
@@ -790,7 +858,18 @@ function onPop(e) {
 
 function onGate(e) {
   const p = arrToV(e.p);
-  gfx.particles.burst(p, 40, 26, { colors: SPLASH_COLORS, life: 1.1, size: 1.8 });
+  gfx.particles.burst(p, 40, 26, { colors: e.race ? GOLD_COLORS : SPLASH_COLORS, life: 1.1, size: 1.8 });
+  if (e.race) {
+    if (e.by === game.myId) {
+      sound.fanfare();
+      showBanner(e.gi >= e.total ? 'FINAL GATE!' : `GATE ${e.gi + 1}/${e.total}`);
+      gfx.addShake(0.2);
+    } else {
+      sound.fanfare(volumeForDistance(p.distanceTo(me.pos)) * 0.4);
+      addFeed(`${nameOf(e.by)} passed a checkpoint`);
+    }
+    return;
+  }
   if (e.by === game.myId) {
     sound.fanfare();
     showBanner('SUPER-CHARGE! +25');
@@ -799,6 +878,24 @@ function onGate(e) {
   } else {
     sound.fanfare(volumeForDistance(p.distanceTo(me.pos)) * 0.5);
     addFeed(`${nameOf(e.by)} blasted through a ring gate`);
+  }
+}
+
+function ordinal(n) { return n === 1 ? '1st' : n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`; }
+
+function onFinish(e) {
+  const p = arrToV(e.p);
+  gfx.particles.burst(p, 60, 34, { colors: GOLD_COLORS, life: 1.6, size: 2.2, gravity: 8 });
+  gfx.particles.burst(p, 30, 18, { colors: FIREWORK_PALETTES[1], life: 1.2, size: 1.8 });
+  if (e.id === game.myId) {
+    sound.personalBest();
+    showBanner(`FINISHED ${ordinal(e.rank).toUpperCase()}! +${e.points}`);
+    addFeed(`Course complete in ${e.time}s · ${e.points} pts`);
+    gfx.addShake(0.5);
+    me.fin = e.rank;
+  } else {
+    sound.fanfare(volumeForDistance(p.distanceTo(me.pos)) * 0.5);
+    addFeed(`${nameOf(e.id)} finished ${ordinal(e.rank)} (+${e.points})`);
   }
 }
 
@@ -884,17 +981,26 @@ function showBanner(text) {
 
 let boardHtml = '';
 function updateBoard(snap) {
+  const race = snap.mode === 'race';
   const rows = snap.players
-    .map((p) => ({ id: p.id, sc: p.sc, ...(game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id }) }))
-    .sort((a, b) => b.sc - a.sc)
+    .map((p) => ({ id: p.id, sc: p.sc, gi: p.gi, gp: p.gp, fin: p.fin, ...(game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id }) }))
+    .sort((a, b) => race
+      ? (b.fin - a.fin || b.gp - a.gp || b.sc - a.sc)
+      : b.sc - a.sc)
     .slice(0, 8);
+  const total = game.course ? game.course.total : 10;
   const html = rows.map((r, i) => {
     const css = trailCss(pilotById(r.pilot));
-    return `<div class="row${r.id === game.myId ? ' me' : ''}${r.id === snap.crownHolderId ? ' crown' : ''}"><span class="rank">${i + 1}</span><span class="dot" style="background:${css};color:${css}"></span><span class="nm">${escapeHtml(r.name)}</span><span class="sc">${r.sc}</span></div>`;
+    const right = race ? (r.fin ? `🏁 ${r.fin}` : `${Math.min(r.gi !== undefined ? r.gi : total, total)}/${total}`) : r.sc;
+    return `<div class="row${r.id === game.myId ? ' me' : ''}${r.id === snap.crownHolderId ? ' crown' : ''}"><span class="rank">${i + 1}</span><span class="dot" style="background:${css};color:${css}"></span><span class="nm">${escapeHtml(r.name)}</span><span class="sc">${right}</span></div>`;
   }).join('');
   if (html !== boardHtml) { boardHtml = html; ui.hudBoard.innerHTML = html; }
-  const holder = snap.crownHolderId ? nameOf(snap.crownHolderId) : (game.mode === 'crown' ? 'loose!' : '');
-  ui.hudCrown.textContent = game.mode === 'crown' ? `👑 ${holder}` : `🎈 ${snap.balloons.filter(Boolean).length} left`;
+  if (race) {
+    ui.hudCrown.textContent = me.fin ? `🏁 FINISHED ${me.fin}` : `🏁 GATE ${Math.min(me.gi + 1, total)}/${total}`;
+  } else {
+    const holder = snap.crownHolderId ? nameOf(snap.crownHolderId) : (game.mode === 'crown' ? 'loose!' : '');
+    ui.hudCrown.textContent = game.mode === 'crown' ? `👑 ${holder}` : `🎈 ${snap.balloons.filter(Boolean).length} left`;
+  }
 }
 
 function formatTime(s) {
@@ -1018,7 +1124,7 @@ function stepLocalFlight(dt) {
   let cd = sup ? ROCKET_COOLDOWN_SUPER : ROCKET_COOLDOWN;
   if (hasFx('rapid')) cd = Math.min(cd, ROCKET_COOLDOWN_RAPID);
   cd *= game.perk.reload;
-  if (controls.fire && t - me.lastFire >= cd) {
+  if (controls.fire && game.mode !== 'race' && t - me.lastFire >= cd) {
     me.lastFire = t;
     if (socket) socket.emit('fire');
     sound.fireworkLaunch();
@@ -1068,9 +1174,21 @@ function activeFx() {
 }
 
 function updateCrownArrow() {
-  if (game.mode !== 'crown' || !crown) { ui.crownArrow.classList.add('hidden'); return; }
-  if (game.crownHolderId === game.myId) { ui.crownArrow.classList.add('hidden'); return; }
-  const target = crown.group.position;
+  let target = null;
+  if (game.mode === 'crown') {
+    if (!crown) { ui.crownArrow.classList.add('hidden'); return; }
+    if (game.crownHolderId === game.myId) { ui.crownArrow.classList.add('hidden'); return; }
+    target = crown.group.position;
+  } else if (game.mode === 'race') {
+    // Point the arrow at your next course gate
+    if (!game.course || me.fin) { ui.crownArrow.classList.add('hidden'); return; }
+    const gates = game.course.gates;
+    const g = gates[clamp(me.gi, 0, gates.length - 1)];
+    target = tmpV.set(g.x, g.y, g.z);
+  } else {
+    ui.crownArrow.classList.add('hidden');
+    return;
+  }
   tmpV2.copy(target).sub(me.pos);
   const d = tmpV2.length();
   // Project direction into camera space to get a 2D angle on screen
