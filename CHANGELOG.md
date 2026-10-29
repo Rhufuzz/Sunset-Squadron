@@ -3,6 +3,28 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.4.0] — 2026-10-29
+
+### Added
+- **4 new pilots (roster 8 → 12):** ORION (Deep Tanks — boost drains 25 % slower),
+  VORTEX (Gyro Lock — rockets steer 30 % sharper), SOLAR (Arc Surge — Super-Charge
+  lasts 35 % longer), STRIDE (Afterburner — boost speed +15 %). All single-stat
+  perks ±15–35 %, wired server- and client-side; compact 2×6 lobby grid.
+- **Sky Mine power-up:** dropped 10 m behind your jet, arms after 1 s, explodes on
+  enemy proximity (< 14 m) with the rocket hit effect (tumble / shield break / crown
+  steal credit), despawns after 25 s. Spiked 3D orb with red arming pulse. Bots
+  avoid armed mines within ~60 m. Events: `mineDrop`, snapshot `mines[]`.
+- **Decoy Flare power-up:** mirror jet flying straight for 6 s that attracts homing
+  rockets (existing homing retargets to a closer decoy); one hit destroys it.
+  Events: `decoySpawn` / `decoyHit`, snapshot `decoys[]`.
+- **Per-round weather:** seeded generator picks clear / breeze / gusty each round;
+  wind drift applies server-side to all jets (≤ 8 % of base speed) and client-side
+  (rain streak particles in gusty); `#hud-weather` pill shows `☀️/💨/🌧️` + label.
+  Included in `roundStart` as `{ type, speed, wind{x,y,z}, label }`.
+- **Bot AI:** lead-target aiming (intercept solution on relative velocity), crown
+  holders evade (lateral weaving + boost away from threats < 200 m), and pursuers
+  sometimes slice the holder's ribbon contrail directly (35 % chance, fire inhibited).
+
 ## [1.3.0] — 2026-10-29
 
 ### Added
