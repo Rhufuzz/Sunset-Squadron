@@ -369,6 +369,9 @@ function fxSnapshot(p, t) {
 // Express + Socket.io
 // ---------------------------------------------------------------------------
 const app = express();
+
+// Self-hosted Three.js (exact version from package.json) — no CDN dependency.
+app.use('/vendor/three', express.static(path.join(__dirname, 'node_modules', 'three'), { etag: true, maxAge: '1d' }));
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
