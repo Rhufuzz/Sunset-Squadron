@@ -227,6 +227,7 @@ html, body {
 }
 #roster li .dot { width: 14px; height: 14px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
 #roster li .tag { font-size: 10px; letter-spacing: 0.15em; color: var(--gold); }
+#roster li .tag.host-tag { color: var(--gold); border: 1px solid var(--gold); border-radius: 4px; padding: 1px 4px; font-weight: bold; }
 #roster li.bot { opacity: 0.75; font-style: italic; }
 
 .settings { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }

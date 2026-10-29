@@ -352,8 +352,8 @@ function renderRoster(lobby) {
     li.appendChild(txt);
     if (p.id === lobby.hostId) {
       const tag = document.createElement('span');
-      tag.className = 'tag';
-      tag.textContent = 'HOST';
+      tag.className = 'tag host-tag';
+      tag.textContent = '👑 HOST';
       li.appendChild(tag);
     }
     if (p.gone) {
@@ -394,9 +394,12 @@ function renderRoster(lobby) {
   ui.rosterPanel.querySelector('.settings').classList.toggle('locked', !isHost);
   ui.btnStart.classList.toggle('hidden', !isHost);
   ui.btnStart.disabled = lobby.phase !== 'lobby';
-  ui.btnStart.textContent = lobby.phase === 'lobby' ? 'START ROUND' : 'ROUND IN PROGRESS';
+  ui.btnStart.textContent = lobby.phase === 'lobby' ? 'START ROUND — YOU ARE THE HOST' : 'ROUND IN PROGRESS';
+  const hostName = (lobby.players.find((p) => p.id === lobby.hostId) || {}).name || 'the host';
   ui.hostWait.classList.toggle('hidden', isHost);
-  ui.hostWait.textContent = lobby.phase === 'playing' ? 'A round is in progress - you will drop in when the host starts the next one or you join now…' : 'Waiting for the host to start the round…';
+  ui.hostWait.textContent = lobby.phase === 'playing'
+    ? `A round is in progress — ${hostName} will start the next one; you can drop in now.`
+    : `⏳ Waiting for HOST ${hostName} to start the round…`;
   if (lobby.settings.preset !== game.preset) {
     game.preset = lobby.settings.preset;
     gfx.applyPreset(game.preset);

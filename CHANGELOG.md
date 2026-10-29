@@ -3,6 +3,28 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.3.0] — 2026-10-29
+
+### Added
+- **Third game mode — Checkpoint Race:** a seeded 10-gate course (open loop, 125–245 m
+  spacing, altitude 40–175 m, gates aligned to travel direction). Your next gate glows
+  gold, the following one cyan; a guide arrow points at it; HUD shows `🏁 GATE n/10`.
+  Scoring is finish-order based: 1st = 100 pts, −15 per rank, min 25. Mid-round
+  finish banner + particles. Rockets are disabled in race mode (barrel rolls still work).
+  Bots fly the full course. Snapshot carries per-player `gi/gp/fin`; the course ships
+  once in `roundStart` (low bandwidth). Leaderboard gains a `race` mode.
+- **Mid-round reconnect:** each client keeps a stable `clientId` in `localStorage`;
+  a dropped player who rejoins within 60 s (`DISCONNECT_GRACE_S`) restores their pilot,
+  name, score/stats and race progress at a safe spawn (short spawn invulnerability).
+  Stale gone-players are cleaned up on round start / lobby return.
+- **Host migration:** the host is the earliest-joined connected human; when they leave,
+  the next-oldest player is promoted (broadcast `hostChange` + `hostId` in lobby/snap
+  payloads), and host controls (START ROUND, mode/preset/bots) move with them.
+- **Host visibility in the lobby:** the host's roster card carries a bordered
+  `👑 HOST` badge, the host's button reads `START ROUND — YOU ARE THE HOST`, and every
+  other player sees `⏳ Waiting for HOST <name> to start the round…` (who the host is
+  was previously invisible to guests — the top support complaint).
+
 ## [1.2.0] — 2026-10-29
 
 ### Added
