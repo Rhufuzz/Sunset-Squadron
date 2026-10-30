@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { Graphics, PRESETS } from './graphics.js';
 import { World, islandCollision, WATER_LEVEL, WORLD_RADIUS, CEILING } from './world.js';
-import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, Meteor, makeEmojiSprite, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
+import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, Meteor, Blimp, makeEmojiSprite, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
 import { Controls } from './controls.js';
 import { SoundEngine } from './audio.js';
 import { PILOTS, PERKS, POWERUPS, pilotById, perkMultipliers, hexCss } from './pilots-data.js';
@@ -160,6 +160,7 @@ const pickups = new Map();  // id -> { mesh: Pickup, alive, type }
 const mines = new Map();    // id -> { mesh: Mine, pos: Vector3 }
 const decoys = new Map();   // id -> { jet: Jet, pos: Vector3, quat: Quaternion, lastAt: number }
 const meteors = new Map();  // id -> { mesh: Meteor } (Meteor Shower event)
+let blimpMesh = null;            // Boss Blimp event
 let crown = null;
 let teamCrowns = null;          // Red vs Blue: {red: Crown, blue: Crown}
 let teamRibbons = null;         // Red vs Blue: {red: Ribbon, blue: Ribbon}
@@ -593,6 +594,7 @@ function clearRoundEntities() {
   }
   emoteSprites.clear();
   removeGoldBalloon();
+  removeBlimp();
   hideEventPill();
   game.event = null;
   if (crown) { gfx.scene.remove(crown.group); crown = null; }
@@ -999,11 +1001,21 @@ function onSnapshot(snap) {
       // Missed the 'event' broadcast (mid-round drop-in): adopt the snapshot state silently
       game.event = { type: snap.ev.t, remain: snap.ev.e, data: {} };
       ui.hudEvent.classList.remove('hidden');
-      ui.hudEventText.textContent = `${EVENT_LABEL[snap.ev.t] || snap.ev.t}`;
-      ui.hudEventHp.classList.toggle('hidden', snap.ev.t !== 'balloonRush');
+      ui.hudEventText.textContent = snap.ev.t === 'blimp' ? '🚨 BOSS BLIMP' : `${EVENT_LABEL[snap.ev.t] || snap.ev.t}`;
+      ui.hudEventHp.classList.toggle('hidden', snap.ev.t !== 'balloonRush' && snap.ev.t !== 'blimp');
     }
     game.event.remain = snap.ev.e;
-    if (typeof snap.ev.hp === 'number' && snap.ev.mh) ui.hudEventHpFill.style.width = `${Math.round((snap.ev.hp / snap.ev.mh) * 100)}%`;
+    if (typeof snap.ev.hp === 'number' && snap.ev.mh) {
+      ui.hudEventHpFill.style.width = `${Math.round((snap.ev.hp / snap.ev.mh) * 100)}%`;
+    }
+    if (snap.ev.t === 'blimp' && snap.ev.p) {
+      if (!blimpMesh) {
+        blimpMesh = new Blimp();
+        gfx.scene.add(blimpMesh.group);
+      }
+      blimpMesh.setPosition(snap.ev.p[0], snap.ev.p[1], snap.ev.p[2]);
+      if (typeof snap.ev.yaw === 'number') blimpMesh.setRotation(snap.ev.yaw);
+    }
   }
   // Crown + ribbon
   if (crown) {
@@ -1203,12 +1215,18 @@ const EVENT_LABEL = {
   balloonRush: '🎈 GOLDEN BALLOON',
   meteorShower: '☄️ METEOR SHOWER',
   frenzy: '⚡ FRENZY',
+  blimp: 'zeppelin', // handled specially below
 };
 const EVENT_FEED = {
   balloonRush: 'GOLDEN BALLOON spotted — burst it for +50 and 10s of Score x2!',
   meteorShower: 'METEOR SHOWER — dodge the flaming rocks! +5 per close shave',
   frenzy: 'FRENZY! Double points everywhere, orbs respawn fast, infinite boost stamina!',
+  blimp: '🚨 BOSS BLIMP ARRIVED — damage it for power-up showers, down it for +100!',
 };
+
+function removeBlimp() {
+  if (blimpMesh) { gfx.scene.remove(blimpMesh.group); blimpMesh.dispose(); blimpMesh = null; }
+}
 
 function removeGoldBalloon() {
   if (goldBalloonMesh) { gfx.scene.remove(goldBalloonMesh.group); goldBalloonMesh = null; }
@@ -1236,6 +1254,7 @@ function onEventMsg(e) {
   if (!e || !e.type) {
     game.event = null;
     removeGoldBalloon();
+    removeBlimp();
     hideEventPill();
     return;
   }
@@ -1253,21 +1272,42 @@ function onEventMsg(e) {
     hideEventPill();
     return;
   }
+  if (e.type === 'blimpDown') {
+    const p = e.p ? arrToV(e.p) : (blimpMesh ? blimpMesh.group.position.clone() : new THREE.Vector3());
+    gfx.particles.burst(p, 80, 50, { colors: GOLD_COLORS, life: 1.8, size: 3.0, gravity: 8 });
+    gfx.particles.burst(p, 40, 25, { colors: FIREWORK_PALETTES[0], life: 1.4, size: 2.2 });
+    gfx.addShake(0.7);
+    sound.eventJingle('balloonPop');
+    if (e.by === game.myId) showBanner(`BLIMP DOWN! +${e.points}`);
+    else addFeed(`${nameOf(e.by)} downed the Boss Blimp (+${e.points})`);
+    game.event = null;
+    removeBlimp();
+    hideEventPill();
+    return;
+  }
   game.event = {
     type: e.type,
     remain: e.endsAt ? Math.max(0, (e.endsAt - Date.now() - game.serverOffset) / 1000) : 0,
     data: e.data || {},
   };
   ui.hudEvent.classList.remove('hidden');
-  ui.hudEventText.textContent = `${EVENT_LABEL[e.type] || e.type}`;
-  ui.hudEventHp.classList.toggle('hidden', e.type !== 'balloonRush');
+  ui.hudEventText.textContent = e.type === 'blimp' ? '🚨 BOSS BLIMP' : `${EVENT_LABEL[e.type] || e.type}`;
+  ui.hudEventHp.classList.toggle('hidden', e.type !== 'balloonRush' && e.type !== 'blimp');
   if (e.type === 'balloonRush') {
     spawnGoldBalloon(e.data.pos || e.pos || { x: 0, y: 120, z: 0 });
     if (typeof e.hp === 'number') ui.hudEventHpFill.style.width = `${Math.round((e.hp / (e.maxHp || 6)) * 100)}%`;
+  } else if (e.type === 'blimp') {
+    removeBlimp();
+    const mesh = new Blimp();
+    const p = e.data.pos || { x: 0, y: 140, z: 0 };
+    mesh.setPosition(p.x, p.y, p.z);
+    gfx.scene.add(mesh.group);
+    blimpMesh = mesh;
+    if (typeof e.hp === 'number') ui.hudEventHpFill.style.width = `${Math.round((e.hp / (e.maxHp || 100)) * 100)}%`;
   }
-  sound.eventJingle(e.type);
+  sound.eventJingle(e.type === 'blimp' ? 'meteorShower' : e.type);
   addFeed(EVENT_FEED[e.type] || e.type);
-  showBanner(`${EVENT_LABEL[e.type] || e.type}!`);
+  showBanner(e.type === 'blimp' ? '🚨 BOSS BLIMP!' : `${EVENT_LABEL[e.type] || e.type}!`);
   gfx.addShake(0.2);
 }
 
@@ -1673,6 +1713,13 @@ function stepRemote(dt) {
   }
   for (const b of balloons.values()) if (b.alive) b.mesh.update(dt, t);
   for (const m of meteors.values()) m.mesh.update(dt, gfx.particles);
+  if (blimpMesh && game.event && game.event.type === 'blimp') {
+    blimpMesh.update(dt, nowS(), gfx.particles);
+    if (game.lastSnap && game.lastSnap.ev && game.lastSnap.ev.p) {
+      blimpMesh.group.position.lerp(arrToV(game.lastSnap.ev.p), 0.4);
+      if (typeof game.lastSnap.ev.yaw === 'number') blimpMesh.group.rotation.y = game.lastSnap.ev.yaw;
+    }
+  }
   if (goldBalloonMesh) goldBalloonMesh.update(dt, t);
   for (const k of pickups.values()) if (k.alive) k.mesh.update(dt, t, k.mesh.group.position.distanceTo(gfx.camera.position) < 350 ? gfx.particles : null);
   if (crown) {

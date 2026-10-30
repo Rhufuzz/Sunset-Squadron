@@ -1,6 +1,6 @@
 {
   "name": "sunset-squadron-crown-chase",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Sunset Squadron: Crown Chase - zero-asset procedural multiplayer 3D jet arcade game for iPads on a shared network",
   "main": "server.js",
   "scripts": {

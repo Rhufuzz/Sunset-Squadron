@@ -856,3 +856,207 @@ export class Meteor {
     this.fireMat.dispose();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Boss Blimp: procedural dirigible warship with rotating propellers, gondola,
+// searchlight and tail fins.
+// ---------------------------------------------------------------------------
+export class Blimp {
+  constructor() {
+    this.group = new THREE.Group();
+
+    // Materials
+    this.hullMat = new THREE.MeshStandardMaterial({
+      color: 0x3d2645,
+      emissive: 0x1f1025,
+      emissiveIntensity: 0.6,
+      roughness: 0.6,
+      metalness: 0.25,
+      flatShading: true,
+    });
+    this.goldMat = new THREE.MeshStandardMaterial({
+      color: 0xffd54a,
+      emissive: 0xffa020,
+      emissiveIntensity: 1.4,
+      roughness: 0.4,
+      metalness: 0.6,
+      flatShading: true,
+    });
+    this.cabinMat = new THREE.MeshStandardMaterial({
+      color: 0x221832,
+      roughness: 0.7,
+      metalness: 0.3,
+      flatShading: true,
+    });
+    this.windowMat = new THREE.MeshStandardMaterial({
+      color: 0xffd54a,
+      emissive: 0xffb04a,
+      emissiveIntensity: 2.8,
+      roughness: 0.3,
+    });
+    this.finMat = new THREE.MeshStandardMaterial({
+      color: 0x8b263e,
+      roughness: 0.6,
+      flatShading: true,
+    });
+    this.beaconMat = new THREE.MeshStandardMaterial({
+      color: 0xff3344,
+      emissive: 0xff2233,
+      emissiveIntensity: 3.5,
+    });
+
+    // Hull envelope (length ~48m, diameter ~22m along Z axis)
+    const envelope = new THREE.Mesh(geo('blimpEnvelope', () => {
+      const g = new THREE.SphereGeometry(11, 14, 10);
+      g.scale(1, 1, 2.2);
+      return g;
+    }), this.hullMat);
+    envelope.castShadow = true;
+    this.group.add(envelope);
+
+    // Gold structural belly & nose bands
+    const ring1 = new THREE.Mesh(geo('blimpRing1', () => new THREE.TorusGeometry(10.8, 0.4, 6, 24)), this.goldMat);
+    ring1.position.z = -7;
+    const ring2 = new THREE.Mesh(geo('blimpRing2', () => new THREE.TorusGeometry(10.8, 0.4, 6, 24)), this.goldMat);
+    ring2.position.z = 7;
+    this.group.add(ring1, ring2);
+
+    // Nose cap
+    const noseCap = new THREE.Mesh(geo('blimpNose', () => {
+      const g = new THREE.ConeGeometry(3.5, 5, 8);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    }), this.goldMat);
+    noseCap.position.z = -23.5;
+    this.group.add(noseCap);
+
+    // Gondola / Cabin underneath
+    const gondola = new THREE.Mesh(geo('blimpGondola', () => new THREE.BoxGeometry(5.5, 4.2, 18)), this.cabinMat);
+    gondola.position.set(0, -11.5, 2);
+    this.group.add(gondola);
+
+    // Glowing observation windows along the gondola flanks
+    for (const sx of [-2.85, 2.85]) {
+      for (let zi = -5; zi <= 5; zi += 2.5) {
+        const win = new THREE.Mesh(geo('blimpWin', () => new THREE.BoxGeometry(0.2, 1.2, 1.4)), this.windowMat);
+        win.position.set(sx, -11.2, 2 + zi);
+        this.group.add(win);
+      }
+    }
+
+    // Forward searchlight
+    const light = new THREE.Mesh(geo('blimpLight', () => {
+      const g = new THREE.CylinderGeometry(1.2, 0.8, 1.5, 8);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    }), this.windowMat);
+    light.position.set(0, -11.5, -7.5);
+    this.group.add(light);
+
+    // Stabilizer fins (top, bottom, left, right at rear)
+    const finShape = geo('blimpFin', () => {
+      const shape = new THREE.Shape();
+      shape.moveTo(0, 0);
+      shape.lineTo(7, -2);
+      shape.lineTo(6, -9);
+      shape.lineTo(0, -6);
+      shape.closePath();
+      const g = new THREE.ExtrudeGeometry(shape, { depth: 0.6, bevelEnabled: false });
+      return g;
+    });
+
+    const finTop = new THREE.Mesh(finShape, this.finMat);
+    finTop.rotation.y = Math.PI / 2;
+    finTop.position.set(0.3, 15, 14);
+    const finBottom = new THREE.Mesh(finShape, this.finMat);
+    finBottom.rotation.y = Math.PI / 2;
+    finBottom.rotation.x = Math.PI;
+    finBottom.position.set(0.3, -15, 14);
+    const finLeft = new THREE.Mesh(finShape, this.finMat);
+    finLeft.rotation.z = Math.PI / 2;
+    finLeft.position.set(-15, 0.3, 14);
+    const finRight = new THREE.Mesh(finShape, this.finMat);
+    finRight.rotation.z = -Math.PI / 2;
+    finRight.position.set(15, -0.3, 14);
+    this.group.add(finTop, finBottom, finLeft, finRight);
+
+    // Top blinking beacon
+    this.beacon = new THREE.Mesh(geo('blimpBeacon', () => new THREE.SphereGeometry(0.8, 8, 6)), this.beaconMat);
+    this.beacon.position.set(0, 15.5, 14);
+    this.group.add(this.beacon);
+
+    // Engine pods with spinning twin propellers
+    this.propellers = [];
+    const propGeo = geo('blimpProp', () => {
+      const g = new THREE.BoxGeometry(0.4, 4.2, 0.1);
+      return g;
+    });
+    for (const sx of [-13, 13]) {
+      const pylon = new THREE.Mesh(geo('blimpPylon', () => new THREE.BoxGeometry(2.5, 0.8, 4)), this.cabinMat);
+      pylon.position.set(sx * 0.7, -7, 6);
+      const pod = new THREE.Mesh(geo('blimpPod', () => {
+        const g = new THREE.CylinderGeometry(1.6, 1.4, 6, 8);
+        g.rotateX(Math.PI / 2);
+        return g;
+      }), this.cabinMat);
+      pod.position.set(sx, -7, 6);
+      const propGroup = new THREE.Group();
+      propGroup.position.set(sx, -7, 9.2);
+      const b1 = new THREE.Mesh(propGeo, this.goldMat);
+      const b2 = b1.clone(); b2.rotation.z = Math.PI / 2;
+      propGroup.add(b1, b2);
+      this.propellers.push(propGroup);
+      this.group.add(pylon, pod, propGroup);
+    }
+
+    this.trailTimer = 0;
+    this.smokeColors = [new THREE.Color(0x3a3045), new THREE.Color(0x1a1425), new THREE.Color(0x554860)];
+  }
+
+  setPosition(x, y, z) {
+    this.group.position.set(x, y, z);
+  }
+
+  setRotation(yaw) {
+    this.group.rotation.y = yaw;
+  }
+
+  update(dt, t, particles) {
+    // Gentle hovering sway
+    this.group.rotation.z = Math.sin(t * 0.8) * 0.04;
+    this.group.rotation.x = Math.sin(t * 0.6) * 0.03;
+
+    // Propellers spin
+    for (const p of this.propellers) p.rotation.z += dt * 18;
+
+    // Flashing beacon
+    this.beaconMat.emissiveIntensity = 2.0 + Math.sin(t * 8) * 2.0;
+
+    // Diesel exhaust smoke puffs from rear engine pods
+    this.trailTimer -= dt;
+    if (particles && this.trailTimer <= 0) {
+      this.trailTimer = 0.08;
+      for (const sx of [-13, 13]) {
+        const back = new THREE.Vector3(sx, -7, 10).applyQuaternion(this.group.quaternion).add(this.group.position);
+        particles.spawn({
+          pos: back,
+          vel: { x: (Math.random() - 0.5) * 4, y: 1 + Math.random() * 2, z: (Math.random() - 0.5) * 4 },
+          life: 1.1,
+          size: 1.6,
+          drag: 1.0,
+          colors: this.smokeColors,
+          glow: 0.8,
+        });
+      }
+    }
+  }
+
+  dispose() {
+    this.hullMat.dispose();
+    this.goldMat.dispose();
+    this.cabinMat.dispose();
+    this.windowMat.dispose();
+    this.finMat.dispose();
+    this.beaconMat.dispose();
+  }
+}

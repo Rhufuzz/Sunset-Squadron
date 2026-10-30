@@ -3,6 +3,19 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.9.0] — 2026-10-30
+
+### Added
+- **Boss Blimp co-op event** (P3 from gameplay roadmap, fourth seeded event in `server/logic.js`):
+  - Procedural dirigible warship with rotating propellers, cabin observation windows, tail fins, and flashing beacon (`public/js/entities.js`).
+  - Circles the outer archipelago at R=400, Y=140, 12 u/s with a 100 HP health pool and live HUD health bar.
+  - Drops slow bombs that detonate on impact or tumble jets.
+  - Power-up shower: drops 3 power-up orbs on reaching 75, 50, and 25 HP thresholds.
+  - Rockets, sky mines, and ramming deal damage; final blow awards +100 points and fires `blimpDown` celebration.
+  - Procedural brass warhorn sound sting (`public/js/audio.js`).
+  - Bots dynamically retarget to assist in attacking the blimp.
+- 4 new unit tests for the blimp event mechanics (`test/blimp.test.js`, 34 tests total).
+
 ## [1.8.0] — 2026-10-30
 
 ### Added

@@ -535,6 +535,24 @@ export class SoundEngine {
         o.start(st);
         o.stop(st + 0.22);
       });
+    } else if (type === 'blimp') {
+      // Ominous warhorn: deep sawtooth chord + brass filter swell
+      [110, 164.81, 220].forEach((f, i) => {
+        const st = t + i * 0.08;
+        const o = ctx.createOscillator();
+        o.type = 'sawtooth';
+        o.frequency.value = f;
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.setValueAtTime(300, st);
+        lp.frequency.exponentialRampToValueAtTime(800, st + 0.4);
+        lp.frequency.exponentialRampToValueAtTime(200, st + 1.2);
+        const g = ctx.createGain();
+        this._env(g, st, 0.18 * volume, 0.06, 1.2);
+        o.connect(lp).connect(g).connect(this.master);
+        o.start(st);
+        o.stop(st + 1.3);
+      });
     } else if (type === 'balloonPop') {
       // Golden balloon burst: big pop + victory arpeggio
       this.fireworkPop(volume);

@@ -75,6 +75,8 @@ const METEOR_HIT_R = 8;              // meteor-jet collision radius (same as roc
 const METEOR_SHAVE_R = 25;           // near-miss radius for the closeShave award
 const GOLD_BALLOON_R = 15;           // giant gold balloon collision radius
 const GOLD_FLYIN_SPEED = 30;         // min speed to burst it by flying into it
+const BLIMP_COLLISION_R = 24;        // boss blimp collision radius
+const BLIMP_RAM_SPEED = 20;          // min speed to damage blimp by ramming
 const SHAVE_THROTTLE_S = 1;          // min seconds between closeShave awards per jet
 
 // Style scoring (all modes, stacked on top of the regular scoring)
@@ -283,6 +285,7 @@ const state = {
   event: null,                  // active event: { type, startedAt, endsAt, data }
   eventFired: false,            // one event per round: blocks re-activation after it ends
   goldBalloon: null,            // balloonRush: { x, y, z, hp, maxHp, alive }
+  blimp: null,                  // blimp event: { hp, maxHp, pos, dir, seed, speed, radius, y, startAng, orbitDir, drops, dropIdx, alive }
   meteors: [],                  // meteorShower: [{ id, p, v, born, awarded }]
   meteorSeq: 1,
   meteorSpawned: 0,
@@ -471,7 +474,7 @@ function pickupRespawnS() {
 
 function collectPickup(k, p, t) {
   k.alive = false;
-  k.respawnAt = t + pickupRespawnS();
+  k.respawnAt = k.isShower ? Infinity : t + pickupRespawnS();
   const dur = grantFx(p, k.type, t);
   p.stats.pickups++;
   if (k.type === 'ghost') {
@@ -516,7 +519,7 @@ function collectPickup(k, p, t) {
 function stepPickups(t) {
   for (const k of state.pickups) {
     if (k.alive) continue;
-    if (t >= k.respawnAt) {
+    if (t >= k.respawnAt && !k.isShower) {
       const pos = randomPickupPos(Math.random);
       // Cycle the type so every orb type keeps appearing
       k.type = POWERUP_TYPES[(POWERUP_TYPES.indexOf(k.type) + 1 + Math.floor(Math.random() * 2)) % POWERUP_TYPES.length];
@@ -809,6 +812,7 @@ function detachPlayer(player) {
     state.rockets = [];
     state.event = null;
     state.goldBalloon = null;
+    state.blimp = null;
     state.meteors = [];
   }
   broadcastLobby();
@@ -835,8 +839,8 @@ function startRound() {
   if (state.phase === 'playing') return;
   // New round = clean slate: pilots who never rejoined lose their seat
   removeAllGone();
-  // New world every round so the archipelago stays fresh
-  state.seed = (Math.random() * 0x7fffffff) >>> 0;
+  // New world every round so the archipelago stays fresh (overridable via SEED env for testing)
+  state.seed = process.env.SEED ? (parseInt(process.env.SEED, 10) >>> 0) : ((Math.random() * 0x7fffffff) >>> 0);
   state.layout = generateLayout(state.seed);
   state.weather = generateWeather(state.seed);
   // Remove previous bots, add new ones
@@ -886,6 +890,7 @@ function startRound() {
   state.event = null;
   state.eventFired = false;
   state.goldBalloon = null;
+  state.blimp = null;
   state.meteors = [];
   state.meteorSeq = 1;
   state.meteorSpawned = 0;
@@ -953,9 +958,10 @@ function returnToLobby() {
   state.decoys = [];
   state.pickups = [];
   state.race = null;
-  state.event = null;
   state.eventPlan = null;
+  state.event = null;
   state.goldBalloon = null;
+  state.blimp = null;
   state.meteors = [];
   state.crown = { holderId: null, pos: { x: 0, y: 95, z: 0 }, ribbon: [] };
   broadcastLobby();
@@ -1215,6 +1221,9 @@ function findHomingTarget(r, t) {
   if (state.settings.mode === 'blitz') {
     for (const b of state.balloons) if (b.alive) consider(b, b.id, 'balloon');
   }
+  if (state.blimp && state.blimp.alive) {
+    consider(state.blimp.pos, 'blimp', 'blimp');
+  }
   return best;
 }
 
@@ -1230,6 +1239,7 @@ function stepRockets(dt, t) {
       let curD = HOMING_RANGE * 2;
       if (r.targetKind === 'player') { const tp = state.players.get(r.target); if (tp) curD = dist(tp.pos, r.p); }
       else if (r.targetKind === 'balloon') { const b = state.balloons[r.target]; if (b) curD = dist(b, r.p); }
+      else if (r.targetKind === 'blimp') { if (state.blimp && state.blimp.alive) curD = dist(state.blimp.pos, r.p); }
       for (const dec of state.decoys) {
         if (dec.owner === r.owner) continue;
         const dd = dist(dec.p, r.p);
@@ -1248,6 +1258,7 @@ function stepRockets(dt, t) {
       let tpos = null;
       if (r.targetKind === 'player') { const tp = state.players.get(r.target); tpos = tp ? tp.pos : null; }
       else if (r.targetKind === 'decoy') { const dec = state.decoys.find((d) => d.id === r.target); tpos = dec ? dec.p : null; }
+      else if (r.targetKind === 'blimp') { tpos = state.blimp && state.blimp.alive ? state.blimp.pos : null; }
       else { const b = state.balloons[r.target]; tpos = b && b.alive ? b : null; }
       if (!tpos) { r.target = null; }
       else {
@@ -1349,6 +1360,11 @@ function stepRockets(dt, t) {
       dead = true;
       hitGoldBalloon(r.owner, t);
     }
+    // Boss Blimp: rocket hit deals 4 hp in every mode
+    if (!dead && state.blimp && state.blimp.alive && dist(state.blimp.pos, r.p) < BLIMP_COLLISION_R) {
+      dead = true;
+      damageBlimp(4, r.owner, t, r.p);
+    }
     if (!dead && islandCollision(r.p, state.layout.islands)) {
       dead = true;
       io.emit('boom', { p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)] });
@@ -1368,7 +1384,12 @@ function stepMines(dt, t) {
     if (t - m.born > 25) continue;
     let dead = false;
     if (t >= m.armAt) {
-      for (const p of state.players.values()) {
+      if (state.blimp && state.blimp.alive && dist(m.p, state.blimp.pos) < BLIMP_COLLISION_R + 6) {
+        dead = true;
+        damageBlimp(6, m.owner, t, m.p);
+        io.emit('boom', { p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] });
+      }
+      if (!dead) for (const p of state.players.values()) {
         if (p.id === m.owner || p.gone) continue;
         if (p.team && m.team && p.team === m.team) continue;   // Red vs Blue: no friendly fire
         const d = dist(m.p, p.pos);
@@ -1480,6 +1501,15 @@ function stepGatesAndPickups(t) {
     const gb = state.goldBalloon;
     if (gb && gb.alive && p.speed > GOLD_FLYIN_SPEED && dist(gb, p.pos) < reach(p, GOLD_BALLOON_R - 1, t)) {
       popGoldBalloon(p.id, t);
+    }
+    // Boss Blimp fly-in / ramming: deals 3 damage to blimp, tumbles the pilot slightly
+    const bl = state.blimp;
+    if (bl && bl.alive && p.speed > BLIMP_RAM_SPEED && dist(bl.pos, p.pos) < reach(p, BLIMP_COLLISION_R, t)) {
+      if (t - (p.lastBlimpRamAt || 0) >= 1.2) {
+        p.lastBlimpRamAt = t;
+        p.tumbleUntil = t + TUMBLE_TIME * 0.5 * p.perk.tumble;
+        damageBlimp(3, p.id, t, p.pos);
+      }
     }
     // Power-up orbs (all modes)
     const pickR = reach(p, PICKUP_RADIUS, t);
@@ -1600,6 +1630,10 @@ function eventPayload(ev) {
     out.hp = state.goldBalloon.hp;
     out.maxHp = state.goldBalloon.maxHp;
     out.pos = { x: r2(state.goldBalloon.x), y: r2(state.goldBalloon.y), z: r2(state.goldBalloon.z) };
+  } else if (ev.type === 'blimp' && state.blimp) {
+    out.hp = state.blimp.hp;
+    out.maxHp = state.blimp.maxHp;
+    out.pos = { x: r2(state.blimp.pos.x), y: r2(state.blimp.pos.y), z: r2(state.blimp.pos.z) };
   }
   return out;
 }
@@ -1610,6 +1644,33 @@ function activateEvent(plan, t) {
     state.goldBalloon = {
       x: plan.data.pos.x, y: plan.data.pos.y, z: plan.data.pos.z,
       hp: plan.data.hp, maxHp: plan.data.hp, alive: true,
+    };
+  } else if (plan.type === 'blimp') {
+    const ang = plan.data.startAng;
+    const r = plan.data.radius;
+    const px = r * Math.cos(ang);
+    const py = plan.data.y;
+    const pz = r * Math.sin(ang);
+    const dir = {
+      x: -Math.sin(ang) * plan.data.orbitDir,
+      y: 0,
+      z: Math.cos(ang) * plan.data.orbitDir,
+    };
+    state.blimp = {
+      hp: plan.data.hp,
+      maxHp: plan.data.maxHp || plan.data.hp,
+      pos: { x: px, y: py, z: pz },
+      dir,
+      yaw: Math.atan2(-dir.x, -dir.z),
+      seed: state.seed,
+      speed: plan.data.speed,
+      radius: r,
+      y: py,
+      startAng: ang,
+      orbitDir: plan.data.orbitDir,
+      drops: plan.data.drops || [],
+      dropIdx: 0,
+      alive: true,
     };
   } else if (plan.type === 'meteorShower') {
     state.meteors = [];
@@ -1624,6 +1685,7 @@ function endEvent() {
   if (!state.event) return;
   state.event = null;
   state.goldBalloon = null;
+  state.blimp = null;
   state.meteors = [];
   io.emit('event', { type: null });
 }
@@ -1636,6 +1698,65 @@ function hitGoldBalloon(byId, t) {
   io.emit('eventProgress', { hp: gb.hp, maxHp: gb.maxHp });
   io.emit('boom', { p: [r2(gb.x), r2(gb.y), r2(gb.z)] });
   if (gb.hp <= 0) popGoldBalloon(byId, t);
+}
+
+function spawnPickupShower(pos) {
+  for (let i = 0; i < 3; i++) {
+    const ang = (i / 3) * Math.PI * 2 + Math.random() * 0.5;
+    const d = 12 + Math.random() * 16;
+    const type = POWERUP_TYPES[Math.floor(Math.random() * POWERUP_TYPES.length)];
+    const pickup = {
+      id: state.pickups.length,
+      type,
+      x: pos.x + Math.cos(ang) * d,
+      y: clamp(pos.y - 8 + (Math.random() - 0.5) * 12, 35, 200),
+      z: pos.z + Math.sin(ang) * d,
+      alive: true,
+      respawnAt: Infinity,
+      isShower: true,
+    };
+    state.pickups.push(pickup);
+    io.emit('pickupSpawn', pickupPublic(pickup));
+  }
+}
+
+/** Rocket, mine, or ram damage on the boss blimp. */
+function damageBlimp(amount, byId, t, hitPos) {
+  const bl = state.blimp;
+  if (!bl || !bl.alive) return;
+  const oldHp = bl.hp;
+  bl.hp = Math.max(0, bl.hp - amount);
+  const pos = hitPos || bl.pos;
+  io.emit('boom', { p: [r2(pos.x), r2(pos.y), r2(pos.z)] });
+  io.emit('eventProgress', { hp: bl.hp, maxHp: bl.maxHp });
+
+  // Every 25 hp lost -> power-up shower: spawn 3 pickups at the blimp's position
+  for (const threshold of [75, 50, 25]) {
+    if (oldHp > threshold && bl.hp <= threshold) {
+      spawnPickupShower(bl.pos);
+    }
+  }
+
+  if (bl.hp <= 0) {
+    killBlimp(byId, t);
+  }
+}
+
+function killBlimp(winnerId, t) {
+  const bl = state.blimp;
+  if (!bl || !bl.alive) return;
+  bl.alive = false;
+  let pts = 100;
+  const p = state.players.get(winnerId);
+  if (p) {
+    pts = awardPoints(p, 100, t);
+    p.stats.hits++;
+  }
+  const pos = [r2(bl.pos.x), r2(bl.pos.y), r2(bl.pos.z)];
+  io.emit('blimpDown', { by: winnerId, points: Math.round(pts), p: pos });
+  console.log(`[event] Boss Blimp downed by ${p ? p.name : winnerId} (+${Math.round(pts)})`);
+  state.blimp = null;
+  endEvent();
 }
 
 /** Golden balloon burst: +50 and a flat 10s Score x2 to the popper, then the event ends. */
@@ -1666,14 +1787,43 @@ function spawnMeteor(def, t) {
   });
 }
 
+function stepBlimp(dt, t) {
+  const bl = state.blimp;
+  if (!bl || !bl.alive || !state.event) return;
+  const elapsed = t - state.event.startedAt;
+  const ang = bl.startAng + bl.orbitDir * (bl.speed / bl.radius) * elapsed;
+  bl.pos.x = bl.radius * Math.cos(ang);
+  bl.pos.y = bl.y;
+  bl.pos.z = bl.radius * Math.sin(ang);
+  bl.dir.x = -Math.sin(ang) * bl.orbitDir;
+  bl.dir.y = 0;
+  bl.dir.z = Math.cos(ang) * bl.orbitDir;
+  bl.yaw = Math.atan2(-bl.dir.x, -bl.dir.z);
+
+  // Blimp fights back: drop slow bombs at seeded times (~every 6s)
+  while (bl.dropIdx < bl.drops.length && elapsed >= bl.drops[bl.dropIdx]) {
+    bl.dropIdx++;
+    state.meteors.push({
+      id: state.meteorSeq++,
+      p: { x: bl.pos.x, y: bl.pos.y - 12, z: bl.pos.z },
+      v: { x: 0, y: -25, z: 0 },
+      born: t,
+      isBomb: true,
+      awarded: {},
+    });
+  }
+}
+
 /** Meteor Shower: spawn the seeded schedule, integrate, jet hits + close shaves. */
 function stepMeteors(dt, t) {
   const ev = state.event;
-  if (!ev || ev.type !== 'meteorShower') return;
-  const elapsed = t - ev.startedAt;
-  const defs = ev.data.meteors;
-  const want = Math.min(ev.data.count, Math.floor(elapsed / ev.data.interval) + 1);
-  while (state.meteorSpawned < want) spawnMeteor(defs[state.meteorSpawned++], t);
+  if (!ev || (ev.type !== 'meteorShower' && ev.type !== 'blimp')) return;
+  if (ev.type === 'meteorShower') {
+    const elapsed = t - ev.startedAt;
+    const defs = ev.data.meteors;
+    const want = Math.min(ev.data.count, Math.floor(elapsed / ev.data.interval) + 1);
+    while (state.meteorSpawned < want) spawnMeteor(defs[state.meteorSpawned++], t);
+  }
   const alive = [];
   for (const m of state.meteors) {
     if (t - m.born > METEOR_LIFE) continue;   // burns up mid-air
@@ -1690,20 +1840,26 @@ function stepMeteors(dt, t) {
           io.emit('shieldBreak', { id: p.id, by: null, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] });
         } else {
           p.tumbleUntil = t + TUMBLE_TIME * p.perk.tumble;
-          io.emit('hit', { shooter: null, victim: p.id, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], crownStolen: false, mine: false, meteor: true });
+          io.emit('hit', { shooter: null, victim: p.id, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], crownStolen: false, mine: false, meteor: true, bomb: Boolean(m.isBomb) });
         }
         io.emit('boom', { p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] });
         break;
       }
-      if (d < METEOR_SHAVE_R && !m.awarded[p.id] && t - (p.lastShaveAt || -9) >= SHAVE_THROTTLE_S) {
+      if (!m.isBomb && d < METEOR_SHAVE_R && !m.awarded[p.id] && t - (p.lastShaveAt || -9) >= SHAVE_THROTTLE_S) {
         m.awarded[p.id] = true;
         p.lastShaveAt = t;
         const pts = awardPoints(p, 5, t);
         io.emit('closeShave', { id: p.id, meteor: m.id, points: Math.round(pts) });
       }
     }
-    if (!dead && islandCollision(m.p, state.layout.islands)) dead = true;
-    if (!dead && m.p.y < WATER_LEVEL) dead = true;
+    if (!dead && islandCollision(m.p, state.layout.islands)) {
+      dead = true;
+      io.emit('boom', { p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] });
+    }
+    if (!dead && m.p.y < WATER_LEVEL) {
+      dead = true;
+      io.emit('boom', { p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], water: true });
+    }
     if (!dead) alive.push(m);
   }
   state.meteors = alive;
@@ -1745,6 +1901,10 @@ function stepEvent(dt, t) {
     return;
   }
   if (state.event && state.event.type === 'meteorShower') stepMeteors(dt, t);
+  if (state.event && state.event.type === 'blimp') {
+    stepBlimp(dt, t);
+    stepMeteors(dt, t);   // blimp bombs ride the meteor stepper
+  }
 }
 
 function stepCrown(dt, t) {
@@ -1846,6 +2006,11 @@ function stepBot(p, dt, t) {
       bs.target = best;
       bs.targetId = best ? `${best.kind}:${best.id}` : null;
     }
+    // Boss Blimp event: bots occasionally divert to attack the blimp in any mode
+    if (state.blimp && state.blimp.alive && Math.random() < 0.45) {
+      bs.targetId = 'blimp';
+      bs.target = null;
+    }
   }
 
   if (mode === 'race' && !p.race.finished) {
@@ -1866,6 +2031,13 @@ function stepBot(p, dt, t) {
   if (!goal && wantedPickup && wantedPickup.alive) {
     goal = { x: wantedPickup.x, y: wantedPickup.y, z: wantedPickup.z };
     wantBoost = hasFx(p, 'turbo', t);
+  } else if (bs.targetId === 'blimp' && state.blimp && state.blimp.alive) {
+    goal = { ...state.blimp.pos };
+    const d = dist(state.blimp.pos, p.pos);
+    wantBoost = d > 200 && p.stamina > 0.4;
+    const toB = vnorm(vsub(state.blimp.pos, p.pos));
+    const fwd = forwardFromYP(p.yaw, p.pitch);
+    if (d < 240 && vdot(toB, fwd) > Math.cos(HOMING_CONE * 0.8)) wantFire = true;
   } else if (mode === 'crown' || mode === 'teams') {
     if (bs.targetId === 'flee') {
       // Crown-holders evade: boost away from nearest threat (pursuer or incoming rocket)
@@ -2085,8 +2257,15 @@ function snapshot(t) {
     mines: state.mines.map((m) => ({ id: m.id, o: m.owner, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], arm: t >= m.armAt ? 1 : 0 })),
     decoys: state.decoys.map((d) => ({ id: d.id, o: d.owner, pilot: d.pilot, p: [r2(d.p.x), r2(d.p.y), r2(d.p.z)], q: [r3(d.quat.x), r3(d.quat.y), r3(d.quat.z), r3(d.quat.w)], spd: r2(d.speed) })),
     balloons: state.settings.mode === 'blitz' ? state.balloons.map((b) => (b.alive ? 1 : 0)) : [],
-    // Active mid-round event (compact): type + seconds remaining (+ gold balloon hp)
-    ...(state.event ? { ev: { t: state.event.type, e: r2(Math.max(0, state.event.endsAt - t)), ...(state.event.type === 'balloonRush' && state.goldBalloon ? { hp: state.goldBalloon.hp, mh: state.goldBalloon.maxHp } : {}) } } : {}),
+    // Active mid-round event (compact): type + seconds remaining (+ gold balloon / blimp hp)
+    ...(state.event ? {
+      ev: {
+        t: state.event.type,
+        e: r2(Math.max(0, state.event.endsAt - t)),
+        ...(state.event.type === 'balloonRush' && state.goldBalloon ? { hp: state.goldBalloon.hp, mh: state.goldBalloon.maxHp } : {}),
+        ...(state.event.type === 'blimp' && state.blimp ? { hp: state.blimp.hp, mh: state.blimp.maxHp, p: [r2(state.blimp.pos.x), r2(state.blimp.pos.y), r2(state.blimp.pos.z)], yaw: r3(state.blimp.yaw) } : {}),
+      }
+    } : {}),
     meteors: state.meteors.map((m) => ({ id: m.id, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)] })),
   };
 }

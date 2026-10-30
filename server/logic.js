@@ -96,10 +96,14 @@ function generateWeather(seed) {
 // ---------------------------------------------------------------------------
 // Mid-round events (seeded per round, all modes)
 // ---------------------------------------------------------------------------
-const EVENT_TYPES = ['balloonRush', 'meteorShower', 'frenzy'];
-const EVENT_DURATIONS = { balloonRush: 60, meteorShower: 45, frenzy: 60 };
+const EVENT_TYPES = ['balloonRush', 'meteorShower', 'frenzy', 'blimp'];
+const EVENT_DURATIONS = { balloonRush: 60, meteorShower: 45, frenzy: 60, blimp: 90 };
 const EVENT_AT_S = 60;                // fires ~60s into a full-length round
 const EVENT_BALLOON_HP = 6;           // rocket hits needed to burst the golden balloon
+const EVENT_BLIMP_HP = 100;           // hp of the boss blimp
+const EVENT_BLIMP_RADIUS = 400;       // circling orbit radius
+const EVENT_BLIMP_SPEED = 12;         // u/s circling speed
+const EVENT_BLIMP_Y = 140;            // circling altitude
 const EVENT_METEOR_COUNT = 18;        // meteors spawned over the meteorShower window
 const EVENT_METEOR_SPEED = 25;        // u/s, matches the server integration step
 // Mirror the server world constants (logic.js stays dependency-free).
@@ -144,6 +148,25 @@ function generateEvent(seed, roundLength = 180) {
       meteors.push({ x: r2(sx), y: r2(sy), z: r2(sz), vx: r2(v.x), vy: r2(v.y), vz: r2(v.z) });
     }
     data = { count: EVENT_METEOR_COUNT, interval: r2(Math.max(0.5, (durS - 4) / EVENT_METEOR_COUNT)), meteors };
+  } else if (type === 'blimp') {
+    const startAng = r2(rand() * Math.PI * 2);
+    const orbitDir = rand() < 0.5 ? 1 : -1;
+    const drops = [];
+    let dropT = 3 + rand() * 3;
+    while (dropT < durS - 2) {
+      drops.push(r2(dropT));
+      dropT += 5.5 + rand() * 1.5;
+    }
+    data = {
+      hp: EVENT_BLIMP_HP,
+      maxHp: EVENT_BLIMP_HP,
+      radius: EVENT_BLIMP_RADIUS,
+      speed: EVENT_BLIMP_SPEED,
+      y: EVENT_BLIMP_Y,
+      startAng,
+      orbitDir,
+      drops,
+    };
   } else {
     data = { mult: 2 };
   }
@@ -211,7 +234,7 @@ module.exports = {
   clamp, lerp, vlen, vsub, vdot, vnorm, vscale, vadd, dist, r2, r3,
   islandCollision,
   WEATHER_TYPES, WEATHER_LABELS, generateWeather,
-  EVENT_TYPES, EVENT_DURATIONS, EVENT_AT_S, EVENT_BALLOON_HP, generateEvent,
+  EVENT_TYPES, EVENT_DURATIONS, EVENT_AT_S, EVENT_BALLOON_HP, EVENT_BLIMP_HP, EVENT_BLIMP_RADIUS, EVENT_BLIMP_SPEED, EVENT_BLIMP_Y, generateEvent,
   homingAngle,
   RACE_FINISH_BASE, RACE_FINISH_STEP, RACE_FINISH_MIN, raceFinishPoints,
   gateCrossing, compareRaceResults,

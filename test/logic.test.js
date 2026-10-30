@@ -69,6 +69,15 @@ test('generateEvent: valid types only, timing inside the round, sane data shape'
         assert.ok(Math.abs(vlen - 25) < 0.01, `velocity ~25 u/s (got ${vlen})`);
         assert.ok(m.vy < 0, 'meteors fall toward the ground');
       }
+    } else if (e.type === 'blimp') {
+      assert.strictEqual(e.data.hp, logic.EVENT_BLIMP_HP);
+      assert.strictEqual(e.data.maxHp, logic.EVENT_BLIMP_HP);
+      assert.strictEqual(e.data.radius, logic.EVENT_BLIMP_RADIUS);
+      assert.strictEqual(e.data.speed, logic.EVENT_BLIMP_SPEED);
+      assert.strictEqual(e.data.y, logic.EVENT_BLIMP_Y);
+      assert.ok(e.data.startAng >= 0 && e.data.startAng <= Math.PI * 2);
+      assert.ok(e.data.orbitDir === 1 || e.data.orbitDir === -1);
+      assert.ok(Array.isArray(e.data.drops) && e.data.drops.length > 0);
     } else {
       assert.strictEqual(e.data.mult, 2);
     }
@@ -85,9 +94,9 @@ test('generateEvent: short (test) rounds clamp start and duration inside the rou
   }
 });
 
-test('generateEvent: all three event types occur over a seed sweep', () => {
+test('generateEvent: all four event types occur over a seed sweep', () => {
   const types = new Set();
-  for (let seed = 0; seed < 300; seed++) types.add(logic.generateEvent(seed, 180).type);
+  for (let seed = 0; seed < 400; seed++) types.add(logic.generateEvent(seed, 180).type);
   assert.deepStrictEqual([...types].sort(), [...logic.EVENT_TYPES].sort());
 });
 
