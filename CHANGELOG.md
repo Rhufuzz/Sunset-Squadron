@@ -3,6 +3,22 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.6.0] — 2026-10-30
+
+### Added
+- **Mid-round events engine** — every round now has one seeded surprise at the ⅓ mark
+  (deterministic per seed via new pure `generateEvent()` in `server/logic.js`; all modes;
+  one per round). Broadcast as an `event` payload, carried compactly in snapshots as
+  `ev:{t,e}`, HUD pill shows name + countdown, distinct procedural jingle per event.
+  - **🎈 Golden Balloon Rush** (60 s): a 3× gold balloon (6 rocket hits / high-speed ram)
+    drops +50 and a 10 s Score×2 on the popper; live HP micro-bar via `eventProgress`.
+  - **☄️ Meteor Shower** (45 s): 18 seeded meteors fall (tumble on hit, shields absorb);
+    +5 for every near-miss within 25 m (throttled 1/s per jet) — dodging scores.
+  - **⚡ Frenzy** (60 s): all points ×2 through the new server-wide `awardPoints()`
+    wrapper, pickup respawns halved, boost stamina unlimited.
+- 4 new unit tests for the event planner (26 total): determinism over 100 seeds, type
+  validity, timing clamps on short rounds, type sweep.
+
 ## [1.5.0] — 2026-10-29
 
 ### Added
