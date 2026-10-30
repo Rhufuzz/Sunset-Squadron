@@ -646,3 +646,6 @@ html, body {
 #results-list li .pb { font-size: 10px; letter-spacing: 0.1em; color: var(--gold); border: 1px solid var(--gold); border-radius: 999px; padding: 2px 7px; white-space: nowrap; animation: pulse 0.7s infinite alternate; }
 .results-bests { margin-top: 12px; padding: 10px 14px; border-radius: 12px; background: rgba(255, 213, 74, 0.14); border: 1px solid var(--gold); color: var(--gold); font-weight: 800; font-size: 14px; line-height: 1.5; }
 .results-bests .pb-title { font-size: 11px; letter-spacing: 0.2em; opacity: 0.85; }
+/* Red vs Blue: team score tally at the top of the round-end list */
+#results-list li.team-tally { justify-content: center; gap: 18px; font-size: 22px; font-weight: 900; border-bottom: none; padding-bottom: 2px; }
+#results-list li.team-tally .t-vs { opacity: 0.5; }

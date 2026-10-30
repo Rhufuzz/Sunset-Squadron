@@ -96,7 +96,11 @@ const BOT_CROWN_EMOTES = ['👑', '😎', '🎉'];
 const BOT_NAMES = ['Wingman Ace', 'Wingman Duke', 'Wingman Pip', 'Wingman Zed'];
 const leaderboard = new Leaderboard();
 const PRESETS = ['sunset', 'noon', 'twilight'];
-const MODES = ['crown', 'blitz', 'race'];
+const MODES = ['crown', 'blitz', 'race', 'teams'];
+
+// Red vs Blue team mode
+const TEAMS = ['red', 'blue'];
+const TEAM_HIT_PTS = 10;            // points for hitting an enemy pilot
 
 // ---------------------------------------------------------------------------
 // Shared deterministic world layout (identical code lives in public/js/world.js)
@@ -322,6 +326,7 @@ function makePlayer(id, name, pilot, isBot) {
     gateSide: {},
     gateCooldown: {},
     race: { gateIndex: 0, gatesPassed: 0, finished: false, finishRank: 0, finishTime: 0 },
+    team: null,                   // 'red' | 'blue' in Red vs Blue mode (assigned at round start)
     joy: { x: 0, y: 0 },
     bot: null,
   };
@@ -330,8 +335,42 @@ function makePlayer(id, name, pilot, isBot) {
 function humans() { return [...state.players.values()].filter((p) => !p.isBot && !p.gone); }
 function bots() { return [...state.players.values()].filter((p) => p.isBot); }
 
-function spawnPlayer(p, index, total) {
-  const ang = (index / Math.max(total, 1)) * Math.PI * 2;
+// ---------------------------------------------------------------------------
+// Red vs Blue teams
+// ---------------------------------------------------------------------------
+/** Put a pilot on the smaller team (Red wins ties so Red/blue alternate for even joins). */
+function assignTeam(p) {
+  if (state.settings.mode !== 'teams') { p.team = null; return p.team; }
+  let red = 0, blue = 0;
+  for (const q of state.players.values()) {
+    if (q.id === p.id || !q.team) continue;
+    if (q.team === 'red') red++; else blue++;
+  }
+  p.team = red <= blue ? 'red' : 'blue';
+  return p.team;
+}
+
+/** Live team score totals (Red vs Blue mode). */
+function teamScores() {
+  let red = 0, blue = 0;
+  for (const p of state.players.values()) {
+    if (p.team === 'red') red += p.score;
+    else if (p.team === 'blue') blue += p.score;
+  }
+  return { red: Math.round(red), blue: Math.round(blue) };
+}
+
+/** Red vs Blue: spawn a pilot with their team, clustered on the team's side of the map. */
+function spawnTeamPlayer(p) {
+  const mates = [...state.players.values()].filter((q) => q.team === p.team);
+  const i = Math.max(0, mates.indexOf(p));
+  const base = p.team === 'red' ? -Math.PI / 2 : Math.PI / 2;
+  spawnPlayer(p, i, mates.length, base, Math.PI * 0.7);
+}
+
+/** baseAng/spread: in Red vs Blue mode each team spawns clustered on its own side. */
+function spawnPlayer(p, index, total, baseAng = 0, spread = Math.PI * 2) {
+  const ang = baseAng + (index / Math.max(total, 1)) * spread;
   const radius = 230;
   p.pos = { x: Math.cos(ang) * radius, y: 70 + (index % 3) * 12, z: Math.sin(ang) * radius };
   // Face the centre of the archipelago
@@ -361,7 +400,7 @@ function respawnPlayer(p, index, total) {
   const keepScore = p.score;
   const keepStats = p.stats;
   const keepRace = p.race;
-  spawnPlayer(p, index, total);
+  if (p.team) spawnTeamPlayer(p); else spawnPlayer(p, index, total);
   p.score = keepScore;
   p.stats = keepStats;
   p.race = keepRace;            // reconnecting mid-race resumes at their next gate
@@ -396,7 +435,7 @@ function awardStyle(p, kind, base, t) {
   return pts;
 }
 function publicPlayer(p) {
-  return { id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, gone: Boolean(p.gone), score: Math.round(p.score) };
+  return { id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, gone: Boolean(p.gone), score: Math.round(p.score), ...(p.team ? { team: p.team } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +481,7 @@ function collectPickup(k, p, t) {
     // Drop an armed proximity mine behind your jet
     const dir = forwardFromYP(p.yaw, p.pitch);
     const dropPos = vsub(p.pos, vscale(dir, 10));
-    const mine = { id: state.mineSeq++, owner: p.id, p: dropPos, born: t, armAt: t + 1.0, alive: true };
+    const mine = { id: state.mineSeq++, owner: p.id, team: p.team || null, p: dropPos, born: t, armAt: t + 1.0, alive: true };
     state.mines.push(mine);
     io.emit('mineDrop', { id: mine.id, owner: mine.owner, p: [r2(mine.p.x), r2(mine.p.y), r2(mine.p.z)] });
   } else if (k.type === 'decoy') {
@@ -759,6 +798,8 @@ function detachPlayer(player) {
     console.log(`[leave] ${player.name}`);
   }
   if (wasHolder) dropCrown(player.pos);
+  const heldTeam = heldTeamCrown(player.id);
+  if (heldTeam) dropTeamCrown(heldTeam, player.pos);
   updateHost();
   if (humans().length === 0 && state.phase !== 'lobby') {
     // Nobody left: reset so the next visitor gets a clean lobby
@@ -783,9 +824,10 @@ function roundStartPayload() {
     serverNow: Date.now(),
     balloons: state.balloons.map((b) => ({ id: b.id, x: r2(b.x), y: r2(b.y), z: r2(b.z), alive: b.alive, tint: b.tint })),
     crown: { holderId: state.crown.holderId, pos: state.crown.pos },
+    ...(state.teamCrowns ? { crowns: { red: { h: state.teamCrowns.red.holderId, pos: state.teamCrowns.red.pos }, blue: { h: state.teamCrowns.blue.holderId, pos: state.teamCrowns.blue.pos } } } : {}),
     pickups: state.pickups.map(pickupPublic),
     course: state.race ? { gates: state.race.course.map((g) => ({ id: g.id, x: r2(g.x), y: r2(g.y), z: r2(g.z), yaw: r3(g.yaw), gateR: g.gateR })), total: state.race.course.length } : null,
-    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, pos: p.pos, yaw: p.yaw })),
+    players: [...state.players.values()].map((p) => ({ id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, ...(p.team ? { team: p.team } : {}), pos: p.pos, yaw: p.yaw })),
   };
 }
 
@@ -811,7 +853,24 @@ function startRound() {
     state.players.set(id, b);
   }
   const all = [...state.players.values()];
-  all.forEach((p, i) => spawnPlayer(p, i, all.length));
+  if (state.settings.mode === 'teams') {
+    // Red vs Blue: alternate humans by join order, then balance bots onto the smaller team
+    for (const p of all) assignTeam(p);
+    const reds = all.filter((p) => p.team === 'red');
+    const blues = all.filter((p) => p.team === 'blue');
+    reds.forEach((p, i) => spawnTeamPlayer(p));
+    blues.forEach((p, i) => spawnTeamPlayer(p));
+    // Team Crown Relay: one crown per team, granted to each team's first pilot
+    const mkCrown = (team, p) => ({ holderId: p ? p.id : null, team, ribbon: [], pos: p ? { x: p.pos.x, y: p.pos.y + 5, z: p.pos.z } : { x: team === 'red' ? -250 : 250, y: 95, z: 0 } });
+    state.teamCrowns = { red: mkCrown('red', reds[0]), blue: mkCrown('blue', blues[0]) };
+    for (const team of ['red', 'blue']) {
+      const h = state.players.get(state.teamCrowns[team].holderId);
+      if (h) { h.burstUntil = now() + CROWN_BURST_TIME; h.invulnUntil = now() + CROWN_BURST_TIME; }
+    }
+  } else {
+    state.teamCrowns = null;
+    all.forEach((p, i) => spawnPlayer(p, i, all.length));
+  }
   state.rockets = [];
   state.mines = [];
   state.decoys = [];
@@ -833,7 +892,7 @@ function startRound() {
   state.roundStartedAt = now();
   io.emit('roundStart', roundStartPayload());
   broadcastLobby();
-  console.log(`[round] started mode=${state.settings.mode} preset=${state.settings.preset} bots=${state.settings.bots} seed=${state.seed} players=${all.length} event=${state.eventPlan.type}@${state.eventPlan.atS}s`);
+  console.log(`[round] started mode=${state.settings.mode} preset=${state.settings.preset} bots=${state.settings.bots} seed=${state.seed} players=${all.length} event=${state.eventPlan.type}@${state.eventPlan.atS}s${state.settings.mode === 'teams' ? ` red=${all.filter((p) => p.team === 'red').length}/blue=${all.filter((p) => p.team === 'blue').length}` : ''}`);
 }
 
 function endRound() {
@@ -846,6 +905,7 @@ function endRound() {
   const results = [...state.players.values()]
     .map((p) => ({
       id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, score: Math.round(p.score),
+      ...(p.team ? { team: p.team } : {}),
       stats: { balloons: p.stats.balloons, hits: p.stats.hits, crownTime: Math.round(p.stats.crownTime), pickups: p.stats.pickups },
       race: {
         finished: p.race.finished, finishRank: p.race.finishRank, finishTime: p.race.finishTime,
@@ -859,10 +919,18 @@ function endRound() {
   } else {
     results.sort((a, b) => b.score - a.score);
   }
+  // Red vs Blue: the winning TEAM is decided by summed team score, not the top individual
+  let winnerTeam = null;
+  let teamTotals = null;
+  if (mode === 'teams') {
+    teamTotals = teamScores();
+    winnerTeam = teamTotals.red > teamTotals.blue ? 'red' : teamTotals.blue > teamTotals.red ? 'blue' : null;
+  }
   const winnerId = results.length ? results[0].id : null;
   // Humans only on the persistent leaderboard
   const humanRows = results.filter((r) => !r.isBot).map((r) => ({
-    name: r.name, pilot: r.pilot, score: r.score, won: r.id === winnerId,
+    name: r.name, pilot: r.pilot, score: r.score,
+    won: mode === 'teams' ? r.team === winnerTeam : r.id === winnerId,
     points: mode === 'crown' ? r.stats.crownTime : r.score,
     balloons: r.stats.balloons, hits: r.stats.hits,
   }));
@@ -871,9 +939,9 @@ function endRound() {
     if (r.isBot) continue;
     r.newBests = bests[Leaderboard.key(r.name, r.pilot)] || [];
   }
-  state.lastResults = { mode, results, endedAt: state.endedAt, winnerId, leaderboard: leaderboard.summary(10) };
+  state.lastResults = { mode, results, endedAt: state.endedAt, winnerId, leaderboard: leaderboard.summary(10), ...(mode === 'teams' ? { teams: teamTotals, winnerTeam } : {}) };
   io.emit('roundEnd', state.lastResults);
-  console.log('[round] ended:', results.map((r) => `${r.name}=${r.score}`).join(', '));
+  console.log(`[round] ended:${mode === 'teams' ? ` RED ${teamTotals.red} - BLUE ${teamTotals.blue} (${winnerTeam || 'draw'});` : ''} ${results.map((r) => `${r.name}=${r.score}`).join(', ')}`);
 }
 
 function returnToLobby() {
@@ -951,8 +1019,10 @@ io.on('connection', (socket) => {
     updateHost();
     const midRound = state.phase === 'playing';
     if (midRound) {
-      // Drop-in mid-round
-      spawnPlayer(player, state.players.size - 1, state.players.size);
+      // Drop-in mid-round (Red vs Blue: balance them onto a team and spawn with it)
+      assignTeam(player);
+      if (player.team) spawnTeamPlayer(player);
+      else spawnPlayer(player, state.players.size - 1, state.players.size);
     }
     if (typeof ack === 'function') ack({ ok: true, id: socket.id, lobby: lobbyPayload() });
     if (midRound) socket.emit('roundStart', roundStartPayload());
@@ -1054,7 +1124,7 @@ function tryFire(p) {
   p.lastFire = t;
   const dir = forwardFromYP(p.yaw, p.pitch);
   const start = vadd(p.pos, vscale(dir, 5));
-  state.rockets.push({ id: state.rocketSeq++, owner: p.id, p: start, d: dir, born: t, target: null, targetKind: null, awarded: {} });
+  state.rockets.push({ id: state.rocketSeq++, owner: p.id, team: p.team || null, p: start, d: dir, born: t, target: null, targetKind: null, awarded: {} });
   io.emit('shot', { id: p.id, p: [r2(start.x), r2(start.y), r2(start.z)] });
   return true;
 }
@@ -1064,6 +1134,38 @@ function dropCrown(pos) {
   state.crown.pos = { x: pos.x, y: Math.max(pos.y, 40), z: pos.z };
   state.crown.ribbon = [];
   io.emit('crown', { holderId: null, by: null, how: 'dropped', pos: state.crown.pos });
+}
+
+// ---- Team Crown Relay (Red vs Blue): one crown per team, steal = enemy-only ----
+function giveTeamCrown(team, toId, how, fromId) {
+  const c = state.teamCrowns && state.teamCrowns[team];
+  if (!c) return;
+  const t = now();
+  c.holderId = toId;
+  c.ribbon = [];
+  const p = state.players.get(toId);
+  if (p) {
+    p.burstUntil = t + CROWN_BURST_TIME;
+    p.invulnUntil = t + CROWN_BURST_TIME;
+  }
+  if (how !== 'pickup') maybeBotEmote(p, t, BOT_CROWN_EMOTES);
+  io.emit('crown', { team, holderId: toId, by: toId, from: fromId || null, how });
+}
+
+function dropTeamCrown(team, pos) {
+  const c = state.teamCrowns && state.teamCrowns[team];
+  if (!c) return;
+  c.holderId = null;
+  c.pos = { x: pos.x, y: Math.max(pos.y, 40), z: pos.z };
+  c.ribbon = [];
+  io.emit('crown', { team, holderId: null, by: null, how: 'dropped', pos: c.pos });
+}
+
+/** The team crown a pilot currently holds in Red vs Blue mode ('red'|'blue'|null). */
+function heldTeamCrown(playerId) {
+  if (!state.teamCrowns) return null;
+  for (const team of ['red', 'blue']) if (state.teamCrowns[team].holderId === playerId) return team;
+  return null;
 }
 
 function giveCrown(toId, how, fromId) {
@@ -1102,6 +1204,7 @@ function findHomingTarget(r, t) {
   };
   for (const p of state.players.values()) {
     if (p.id === r.owner) continue;
+    if (p.team && r.team && p.team === r.team) continue;   // Red vs Blue: no friendly fire
     if (hasFx(p, 'ghost', t)) continue;   // Ghost: invisible to homing
     consider(p.pos, p.id, 'player');
   }
@@ -1166,6 +1269,7 @@ function stepRockets(dt, t) {
     // Player hits / deflections
     for (const p of state.players.values()) {
       if (p.id === r.owner) continue;
+      if (p.team && r.team && p.team === r.team) continue;   // Red vs Blue: no friendly fire
       const d = dist(p.pos, r.p);
       if (d < 16 && t < p.rollingUntil && !r.deflected) {
         // Barrel roll deflects the rocket away from the dodging jet
@@ -1195,6 +1299,14 @@ function stepRockets(dt, t) {
           giveCrown(shooter.id, 'rocket', p.id);
         } else if (state.settings.mode === 'blitz' && shooter) {
           awardPoints(shooter, 5, t);
+        } else if (state.settings.mode === 'teams' && shooter) {
+          awardPoints(shooter, TEAM_HIT_PTS, t);
+          // Rocket the enemy crown holder → relay steal
+          const victimCrown = heldTeamCrown(p.id);
+          if (victimCrown && p.team !== shooter.team) {
+            crownStolen = true;
+            giveTeamCrown(victimCrown, shooter.id, 'rocket', p.id);
+          }
         }
         io.emit('hit', { shooter: r.owner, victim: p.id, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], crownStolen });
         break;
@@ -1204,6 +1316,7 @@ function stepRockets(dt, t) {
     if (!dead) {
       for (const p of state.players.values()) {
         if (p.id === r.owner || p.gone || r.awarded[p.id]) continue;
+        if (p.team && r.team && p.team === r.team) continue;   // no style credit off teammates' rockets
         if (dist(p.pos, r.p) < STYLE_CLOSE_CALL_R
           && t - p.lastCloseCallAt >= STYLE_CLOSE_CALL_THROTTLE_S) {
           r.awarded[p.id] = true;   // once per rocket
@@ -1257,6 +1370,7 @@ function stepMines(dt, t) {
     if (t >= m.armAt) {
       for (const p of state.players.values()) {
         if (p.id === m.owner || p.gone) continue;
+        if (p.team && m.team && p.team === m.team) continue;   // Red vs Blue: no friendly fire
         const d = dist(m.p, p.pos);
         if (d < 14 && t >= p.invulnUntil && !(t < p.rollingUntil)) {
           dead = true;
@@ -1274,6 +1388,14 @@ function stepMines(dt, t) {
               giveCrown(miner.id, 'mine', p.id);
             } else if (state.settings.mode === 'blitz' && miner) {
               awardPoints(miner, 5, t);
+            } else if (state.settings.mode === 'teams' && miner) {
+              awardPoints(miner, TEAM_HIT_PTS, t);
+              // Mine the enemy crown holder → relay steal
+              const victimCrown = heldTeamCrown(p.id);
+              if (victimCrown && p.team !== miner.team) {
+                crownStolen = true;
+                giveTeamCrown(victimCrown, miner.id, 'mine', p.id);
+              }
             }
             io.emit('hit', { shooter: m.owner, victim: p.id, p: [r2(m.p.x), r2(m.p.y), r2(m.p.z)], crownStolen, mine: true });
           }
@@ -1366,53 +1488,104 @@ function stepGatesAndPickups(t) {
     }
     if (mode === 'race') {
       stepRaceGate(p, t);
-    } else if (mode === 'blitz') {
-      // Balloons popped by flying straight into them
-      const balloonR = reach(p, 9, t);
-      for (const b of state.balloons) {
-        if (b.alive && dist(b, p.pos) < balloonR) popBalloon(b, p.id, t);
+    } else {
+      if (mode === 'blitz') {
+        // Balloons popped by flying straight into them
+        const balloonR = reach(p, 9, t);
+        for (const b of state.balloons) {
+          if (b.alive && dist(b, p.pos) < balloonR) popBalloon(b, p.id, t);
+        }
       }
-      // Ring gates: detect crossing the gate plane inside the ring radius
-      for (const a of state.layout.arches) {
-        const rel = { x: p.pos.x - a.x, y: p.pos.y - a.y, z: p.pos.z - a.z };
-        // Gate normal in XZ plane (arch rotated by yaw around Y; torus lies in the plane perpendicular to normal)
-        const nx = Math.sin(a.yaw), nz = Math.cos(a.yaw);
-        const along = rel.x * nx + rel.z * nz;
-        const lateral = Math.hypot(rel.x * nz - rel.z * nx, rel.y);
-        const side = along >= 0 ? 1 : -1;
-        const prev = p.gateSide[a.id];
-        if (prev !== undefined && prev !== side && Math.abs(along) < 30 && lateral < a.gateR + 1.5) {
-          if (!(p.gateCooldown[a.id] > t)) {
-            p.gateCooldown[a.id] = t + 3;
-            // Style: GATE WEAVE — barrel roll active while blasting through the arch
-            if (t < p.rollingUntil) awardStyle(p, 'gateWeave', STYLE_GATE_WEAVE_PTS, t);
-            awardPoints(p, 25, t);
-            p.superUntil = t + SUPER_TIME * (p.perk && p.perk.superTime ? p.perk.superTime : 1);
-            io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)] });
+      if (mode === 'blitz' || mode === 'teams') {
+        // Ring gates: detect crossing the gate plane inside the ring radius
+        // (Blitz and Red vs Blue: +25 and an 8s Super-Charge)
+        for (const a of state.layout.arches) {
+          const rel = { x: p.pos.x - a.x, y: p.pos.y - a.y, z: p.pos.z - a.z };
+          // Gate normal in XZ plane (arch rotated by yaw around Y; torus lies in the plane perpendicular to normal)
+          const nx = Math.sin(a.yaw), nz = Math.cos(a.yaw);
+          const along = rel.x * nx + rel.z * nz;
+          const lateral = Math.hypot(rel.x * nz - rel.z * nx, rel.y);
+          const side = along >= 0 ? 1 : -1;
+          const prev = p.gateSide[a.id];
+          if (prev !== undefined && prev !== side && Math.abs(along) < 30 && lateral < a.gateR + 1.5) {
+            if (!(p.gateCooldown[a.id] > t)) {
+              p.gateCooldown[a.id] = t + 3;
+              // Style: GATE WEAVE — barrel roll active while blasting through the arch
+              if (t < p.rollingUntil) awardStyle(p, 'gateWeave', STYLE_GATE_WEAVE_PTS, t);
+              awardPoints(p, 25, t);
+              p.superUntil = t + SUPER_TIME * (p.perk && p.perk.superTime ? p.perk.superTime : 1);
+              io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)] });
+            }
+          }
+          p.gateSide[a.id] = side;
+        }
+      }
+      if (mode === 'crown') {
+        // Crown mode: pick up a loose crown, or steal through the holder's ribbon contrail
+        const c = state.crown;
+        if (!c.holderId) {
+          if (dist(c.pos, p.pos) < reach(p, 12, t)) giveCrown(p.id, 'pickup', null);
+        } else if (c.holderId !== p.id && t >= (state.players.get(c.holderId) || {}).invulnUntil) {
+          const ribbonR = reach(p, 7, t);
+          for (const seg of c.ribbon) {
+            if (t - seg.t < RIBBON_MIN_AGE) continue;
+            if (Math.hypot(seg.x - p.pos.x, seg.y - p.pos.y, seg.z - p.pos.z) < ribbonR) {
+              const prevHolder = c.holderId;
+              const victim = state.players.get(prevHolder);
+              if (victim) victim.tumbleUntil = t + TUMBLE_TIME * 0.5;
+              giveCrown(p.id, 'ribbon', prevHolder);
+              io.emit('hit', { shooter: p.id, victim: prevHolder, p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)], crownStolen: true, ribbon: true });
+              break;
+            }
           }
         }
-        p.gateSide[a.id] = side;
-      }
-    } else {
-      // Crown mode: pick up a loose crown, or steal through the holder's ribbon contrail
-      const c = state.crown;
-      if (!c.holderId) {
-        if (dist(c.pos, p.pos) < reach(p, 12, t)) giveCrown(p.id, 'pickup', null);
-      } else if (c.holderId !== p.id && t >= (state.players.get(c.holderId) || {}).invulnUntil) {
-        const ribbonR = reach(p, 7, t);
-        for (const seg of c.ribbon) {
-          if (t - seg.t < RIBBON_MIN_AGE) continue;
-          if (Math.hypot(seg.x - p.pos.x, seg.y - p.pos.y, seg.z - p.pos.z) < ribbonR) {
-            const prevHolder = c.holderId;
-            const victim = state.players.get(prevHolder);
-            if (victim) victim.tumbleUntil = t + TUMBLE_TIME * 0.5;
-            giveCrown(p.id, 'ribbon', prevHolder);
-            io.emit('hit', { shooter: p.id, victim: prevHolder, p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)], crownStolen: true, ribbon: true });
-            break;
+      } else if (mode === 'teams' && state.teamCrowns) {
+        // Team Crown Relay: grab loose crowns (recovery or steal); slice an ENEMY
+        // holder's ribbon to steal. Your own team's held crown can't be touched.
+        for (const team of ['red', 'blue']) {
+          const c = state.teamCrowns[team];
+          if (!c.holderId) {
+            if (dist(c.pos, p.pos) < reach(p, 12, t)) giveTeamCrown(team, p.id, 'pickup', null);
+          } else if (c.holderId !== p.id && p.team !== team && t >= (state.players.get(c.holderId) || {}).invulnUntil) {
+            const ribbonR = reach(p, 7, t);
+            for (const seg of c.ribbon) {
+              if (t - seg.t < RIBBON_MIN_AGE) continue;
+              if (Math.hypot(seg.x - p.pos.x, seg.y - p.pos.y, seg.z - p.pos.z) < ribbonR) {
+                const prevHolder = c.holderId;
+                const victim = state.players.get(prevHolder);
+                if (victim) victim.tumbleUntil = t + TUMBLE_TIME * 0.5;
+                giveTeamCrown(team, p.id, 'ribbon', prevHolder);
+                io.emit('hit', { shooter: p.id, victim: prevHolder, p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)], crownStolen: true, ribbon: true });
+                break;
+              }
+            }
           }
         }
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Red vs Blue: per-team crown tick + ribbon trail (loose crowns drift home)
+// ---------------------------------------------------------------------------
+function stepTeamCrown(team, dt, t) {
+  const c = state.teamCrowns[team];
+  if (c.holderId) {
+    const h = state.players.get(c.holderId);
+    if (!h || h.gone) { dropTeamCrown(team, c.pos); return; }
+    c.pos = { x: h.pos.x, y: h.pos.y + 5, z: h.pos.z };
+    awardPoints(h, dt, t);
+    h.stats.crownTime += dt;
+    const back = forwardFromYP(h.yaw, h.pitch);
+    c.ribbon.push({ x: h.pos.x - back.x * 4, y: h.pos.y - back.y * 4 + 0.5, z: h.pos.z - back.z * 4, t });
+    if (c.ribbon.length > RIBBON_POINTS) c.ribbon.shift();
+  } else {
+    // Loose crown bobs and drifts home so the owning team can recover it
+    const homeX = team === 'red' ? -250 : 250;
+    c.pos.y = clamp(c.pos.y + Math.sin(t * 1.5) * 0.08, 30, 200);
+    c.pos.x = lerp(c.pos.x, homeX, dt * 0.05);
+    c.pos.z = lerp(c.pos.z, 0, dt * 0.05);
   }
 }
 
@@ -1575,6 +1748,7 @@ function stepEvent(dt, t) {
 }
 
 function stepCrown(dt, t) {
+  if (state.teamCrowns) { stepTeamCrown('red', dt, t); stepTeamCrown('blue', dt, t); return; }
   const c = state.crown;
   if (c.holderId) {
     const h = state.players.get(c.holderId);
@@ -1634,6 +1808,23 @@ function stepBot(p, dt, t) {
       // Course is computed per-frame below; retargeting is only used for pickups (skipped while racing)
       bs.target = null;
       bs.targetId = 'race';
+    } else if (mode === 'teams') {
+      // Red vs Blue: 50 % hunt the enemy crown holder, otherwise nearest enemy
+      let best = null, bestD = Infinity;
+      if (Math.random() < 0.5 && state.teamCrowns) {
+        const enemyTeam = p.team === 'red' ? 'blue' : 'red';
+        const ec = state.teamCrowns[enemyTeam];
+        const eh = ec.holderId && state.players.get(ec.holderId);
+        if (eh && !eh.gone) best = eh.id;
+      }
+      if (!best) {
+        for (const o of state.players.values()) {
+          if (o.id === p.id || o.gone || o.team === p.team) continue;
+          const d = dist(o.pos, p.pos);
+          if (d < bestD) { bestD = d; best = o.id; }
+        }
+      }
+      bs.targetId = best;
     } else {
       // Blitz: nearest balloon, or occasionally an arch for the super-charge
       let best = null, bestD = Infinity;
@@ -1675,7 +1866,7 @@ function stepBot(p, dt, t) {
   if (!goal && wantedPickup && wantedPickup.alive) {
     goal = { x: wantedPickup.x, y: wantedPickup.y, z: wantedPickup.z };
     wantBoost = hasFx(p, 'turbo', t);
-  } else if (mode === 'crown') {
+  } else if (mode === 'crown' || mode === 'teams') {
     if (bs.targetId === 'flee') {
       // Crown-holders evade: boost away from nearest threat (pursuer or incoming rocket)
       let nearestThreat = null, nd = Infinity;
@@ -1872,6 +2063,7 @@ function snapshot(t) {
     hostId: state.hostId,
     crownPos: [r2(c.pos.x), r2(c.pos.y), r2(c.pos.z)],
     ribbon: c.ribbon.map((s) => [r2(s.x), r2(s.y), r2(s.z)]),
+    ...(state.teamCrowns ? { crowns: { red: { h: state.teamCrowns.red.holderId, pos: [r2(state.teamCrowns.red.pos.x), r2(state.teamCrowns.red.pos.y), r2(state.teamCrowns.red.pos.z)] }, blue: { h: state.teamCrowns.blue.holderId, pos: [r2(state.teamCrowns.blue.pos.x), r2(state.teamCrowns.blue.pos.y), r2(state.teamCrowns.blue.pos.z)] } } } : {}),
     players: [...state.players.values()].map((p) => ({
       id: p.id,
       p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)],
@@ -1885,6 +2077,7 @@ function snapshot(t) {
       rl: t < p.rollingUntil ? r2(p.rollingUntil - t) : 0,
       st: r2(p.stamina),
       fx: fxSnapshot(p, t),
+      ...(p.team ? { tm: p.team === 'blue' ? 'b' : 'r' } : {}),
       ...(state.settings.mode === 'race' ? { gi: p.race.gateIndex, gp: p.race.gatesPassed, fin: p.race.finished ? p.race.finishRank : 0 } : {}),
     })),
     pickups: state.pickups.map((k) => (k.alive ? 1 : 0)),

@@ -24,8 +24,11 @@ const BARREL_ROLL_TIME = 0.45;
 const STATE_SEND_MS = 50;
 const LERP = 0.25;
 
-const MODE_LABEL = { crown: 'CROWN TAG', blitz: 'ARCH & BALLOON BLITZ', race: 'CHECKPOINT RACE' };
-const MODE_NAME = { crown: 'Crown Tag', blitz: 'Blitz', race: 'Checkpoint Race' };
+const MODE_LABEL = { crown: 'CROWN TAG', blitz: 'ARCH & BALLOON BLITZ', race: 'CHECKPOINT RACE', teams: 'RED VS BLUE' };
+const MODE_NAME = { crown: 'Crown Tag', blitz: 'Blitz', race: 'Checkpoint Race', teams: 'Red vs Blue' };
+const TEAM_HEX = { red: 0xff5e5b, blue: 0x47c8ff };
+const TEAM_CSS = { red: '#ff5e5b', blue: '#47c8ff' };
+function teamOf(id) { const n = game.names.get(id); return n && n.team ? n.team : null; }
 const RACE_GATE_COLOR = 0x4ff1ff;
 const RACE_GATE_ACTIVE = 0xffd54a;
 
@@ -117,6 +120,8 @@ const game = {
   lastSnap: null,
   lastSnapAt: 0,
   crownHolderId: null,
+  teamCrownHolders: { red: null, blue: null },
+  myTeam: null,
   course: null,            // race mode: { gates: [...], total }
   names: new Map(),        // id -> { name, pilot, isBot }
   event: null,             // active mid-round event: { type, remain, data }
@@ -156,6 +161,9 @@ const mines = new Map();    // id -> { mesh: Mine, pos: Vector3 }
 const decoys = new Map();   // id -> { jet: Jet, pos: Vector3, quat: Quaternion, lastAt: number }
 const meteors = new Map();  // id -> { mesh: Meteor } (Meteor Shower event)
 let crown = null;
+let teamCrowns = null;          // Red vs Blue: {red: Crown, blue: Crown}
+let teamRibbons = null;         // Red vs Blue: {red: Ribbon, blue: Ribbon}
+let teamTrails = { red: [], blue: [] };   // client-side holder position history for team ribbons
 let ribbon = null;
 let goldBalloonMesh = null; // Golden Balloon Rush event
 let raceGates = [];        // race mode: [{ group, mat, haloMat, pos }] per course gate
@@ -278,7 +286,7 @@ function renderLeaderboard() {
     const pilot = pilotById(e.pilot);
     const tr = document.createElement('tr');
     if (myName && e.name === myName && e.pilot === game.pilotId) tr.classList.add('mine');
-    const unit = game.lbMode === 'crown' ? `${Math.round(e.totalPoints)}s crown` : game.lbMode === 'race' ? `${Math.round(e.totalPoints)} pts` : `${e.balloons} balloons`;
+    const unit = game.lbMode === 'crown' ? `${Math.round(e.totalPoints)}s crown` : game.lbMode === 'race' ? `${Math.round(e.totalPoints)} pts` : game.lbMode === 'teams' ? `${Math.round(e.totalPoints)} pts` : `${e.balloons} balloons`;
     tr.innerHTML = `<td class="num">${e.rank}</td><td></td><td class="num">${e.wins}</td><td class="num">${e.bestScore}</td><td class="num">${e.rounds}</td>`;
     const cell = tr.children[1];
     const wrap = document.createElement('div');
@@ -344,7 +352,8 @@ function renderRoster(lobby) {
   const isHost = lobby.hostId === game.myId;
   ui.roster.innerHTML = '';
   for (const p of lobby.players) {
-    game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot });
+    const prev = game.names.get(p.id) || {};
+    game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot, team: p.team || prev.team || null });
     const pilot = pilotById(p.pilot);
     const li = document.createElement('li');
     if (p.isBot) li.classList.add('bot');
@@ -371,6 +380,14 @@ function renderRoster(lobby) {
       const tag = document.createElement('span');
       tag.className = 'tag';
       tag.textContent = 'RECONNECTING…';
+      li.appendChild(tag);
+    }
+    if (p.team || prev.team) {
+      const team = p.team || prev.team;
+      const tag = document.createElement('span');
+      tag.className = 'tag team-tag';
+      tag.textContent = team === 'blue' ? '🔵 BLUE' : '🔴 RED';
+      tag.style.color = TEAM_CSS[team];
       li.appendChild(tag);
     }
     if (p.id === game.myId) {
@@ -580,6 +597,7 @@ function clearRoundEntities() {
   game.event = null;
   if (crown) { gfx.scene.remove(crown.group); crown = null; }
   if (ribbon) { gfx.scene.remove(ribbon.mesh); ribbon = null; }
+  if (teamCrowns) { for (const t of ['red', 'blue']) { gfx.scene.remove(teamCrowns[t].group); gfx.scene.remove(teamRibbons[t].mesh); } teamCrowns = null; teamRibbons = null; teamTrails = { red: [], blue: [] }; }
   for (const g of raceGates) { gfx.scene.remove(g.group); g.mat.dispose(); g.haloMat.dispose(); }
   raceGates = [];
   raceHiIndex = -1;
@@ -666,7 +684,7 @@ function startRound(data) {
   game.windVec.set(game.weather.wind.x || 0, 0, game.weather.wind.z || 0);
   if (ui.hudWeather) ui.hudWeather.textContent = game.weather.label;
 
-  for (const p of data.players) game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot });
+  for (const p of data.players) game.names.set(p.id, { name: p.name, pilot: p.pilot, isBot: p.isBot, team: p.team || null });
 
   // Local jet
   const self = data.players.find((p) => p.id === game.myId);
@@ -675,6 +693,7 @@ function startRound(data) {
   const myName = self ? self.name : (game.playerName || myPilot.callsign);
   if (me.jet) { gfx.scene.remove(me.jet.group); me.jet.dispose(); }
   me.jet = new Jet(myPilot, myName, portraitCanvas(myPilot, 64));
+  me.jet.setTeam(self ? self.team : null);
   gfx.scene.add(me.jet.group);
   if (self) { me.pos.set(self.pos.x, self.pos.y, self.pos.z); me.yaw = self.yaw; }
   else { me.pos.set(0, 90, 260); me.yaw = 0; }
@@ -696,6 +715,26 @@ function startRound(data) {
   ribbon = new Ribbon(48);
   gfx.scene.add(ribbon.mesh);
   game.crownHolderId = data.crown.holderId;
+
+  // Red vs Blue: two team crowns (relay) — tinted per team, rendered from snapshot
+  if (data.crowns) {
+    teamCrowns = {};
+    teamRibbons = {};
+    teamTrails = { red: [], blue: [] };
+    for (const team of ['red', 'blue']) {
+      const cm = new Crown();
+      cm.mat.color.set(team === 'red' ? 0xff6b6b : 0x6ba8ff);
+      cm.mat.emissive.set(team === 'red' ? 0xd63031 : 0x0984e3);
+      const cp = data.crowns[team].pos || { x: 0, y: 95, z: 0 };
+      cm.group.position.set(cp.x, cp.y, cp.z);
+      gfx.scene.add(cm.group);
+      teamCrowns[team] = cm;
+      const rb = new Ribbon(48);
+      gfx.scene.add(rb.mesh);
+      teamRibbons[team] = rb;
+    }
+    game.teamCrownHolders = { red: data.crowns.red.h, blue: data.crowns.blue.h };
+  }
 
   // Balloons (blitz only)
   if (data.mode === 'blitz') {
@@ -731,9 +770,11 @@ function startRound(data) {
   ui.btnFire.classList.toggle('hidden', data.mode === 'race');   // no fireworks on the race course
   controls.setEnabled(true);
   checkOrientation();
-  showBanner(data.mode === 'crown' ? 'CHASE THE CROWN!' : data.mode === 'race' ? 'RACE THE COURSE!' : 'POP & DIVE!');
+  showBanner(data.mode === 'teams' ? 'RED VS BLUE!'
+    : data.mode === 'crown' ? 'CHASE THE CROWN!' : data.mode === 'race' ? 'RACE THE COURSE!' : 'POP & DIVE!');
   sound.fanfare(0.7);
-  addFeed(data.mode === 'crown' ? 'Grab the Golden Crown: +1 pt every second you hold it'
+  addFeed(data.mode === 'teams' ? `You are on the ${self && self.team === 'blue' ? 'BLUE' : 'RED'} team — hit enemy jets for +10, no friendly fire`
+    : data.mode === 'crown' ? 'Grab the Golden Crown: +1 pt every second you hold it'
     : data.mode === 'race' ? `Fly through all ${game.course ? game.course.total : 10} gates in order · 1st finish = 100 pts`
     : 'Balloons +10 · Ring gates +25 and SUPER-CHARGE');
 }
@@ -747,21 +788,43 @@ function endRound(results) {
   game.event = null;
   removeGoldBalloon();
   hideEventPill();
-  ui.resultsTitle.textContent = results.results.length && results.results[0].id === game.myId ? 'YOU WIN!' : 'ROUND OVER';
+  if (results.mode === 'teams') {
+    // Red vs Blue: the headline is the team result, not the top individual
+    const ts = results.teams || { red: 0, blue: 0 };
+    const myRow = results.results.find((r) => r.id === game.myId);
+    const won = results.winnerTeam && myRow && myRow.team === results.winnerTeam;
+    const hi = Math.max(ts.red, ts.blue), lo = Math.min(ts.red, ts.blue);
+    ui.resultsTitle.textContent = results.winnerTeam
+      ? `${won ? 'VICTORY! ' : ''}${results.winnerTeam === 'red' ? '🔴 RED' : '🔵 BLUE'} WINS ${hi}–${lo}`
+      : `DRAW ${ts.red}–${ts.blue}`;
+    if (won) sound.personalBest();
+  } else {
+    ui.resultsTitle.textContent = results.results.length && results.results[0].id === game.myId ? 'YOU WIN!' : 'ROUND OVER';
+  }
   ui.resultsList.innerHTML = '';
+  if (results.mode === 'teams') {
+    const ts = results.teams || { red: 0, blue: 0 };
+    const tally = document.createElement('li');
+    tally.className = 'team-tally';
+    tally.innerHTML = `<span class="t-red" style="color:${TEAM_CSS.red}">🔴 RED ${ts.red}</span><span class="t-vs">·</span><span class="t-blue" style="color:${TEAM_CSS.blue}">🔵 BLUE ${ts.blue}</span>`;
+    ui.resultsList.appendChild(tally);
+  }
   let myBests = [];
   results.results.forEach((r, i) => {
     const pilot = pilotById(r.pilot);
     const li = document.createElement('li');
     const st = r.stats || {};
+    const teamCss = r.team ? TEAM_CSS[r.team] : null;
     const statTxt = results.mode === 'race'
       ? (r.race && r.race.finished
         ? `🏁 ${ordinal(r.race.finishRank)} · ${r.race.finishTime}s · ${r.score} pts`
         : `${r.race ? `${r.race.gatesPassed}/${r.race.total}` : '0'} gates · ${r.score} pts`)
-      : results.mode === 'crown' ? `${st.crownTime || 0}s crown · ${st.hits || 0} hits` : `${st.balloons || 0} balloons · ${st.hits || 0} hits`;
-    li.innerHTML = `<span class="rank">${i + 1}.</span><span class="portrait-slot"></span><span class="nm">${escapeHtml(r.name)}${r.id === game.myId ? ' (you)' : ''}<small>${escapeHtml(pilot.callsign)}${r.isBot ? ' · AI' : ''}</small></span><span class="st">${statTxt}</span><span class="sc">${r.score}</span>`;
+      : results.mode === 'crown' ? `${st.crownTime || 0}s crown · ${st.hits || 0} hits`
+      : results.mode === 'teams' ? `${st.hits || 0} hits · ${st.pickups || 0} orbs`
+      : `${st.balloons || 0} balloons · ${st.hits || 0} hits`;
+    li.innerHTML = `<span class="rank">${i + 1}.</span><span class="portrait-slot"></span><span class="nm">${escapeHtml(r.name)}${r.id === game.myId ? ' (you)' : ''}<small>${escapeHtml(pilot.callsign)}${r.isBot ? ' · AI' : ''}${r.team ? ` · ${r.team === 'blue' ? '🔵 BLUE' : '🔴 RED'}` : ''}</small></span><span class="st">${statTxt}</span><span class="sc">${r.score}</span>`;
     li.querySelector('.portrait-slot').replaceWith(portraitElement(pilot, 30));
-    li.querySelector('.nm').style.color = trailCss(pilot);
+    li.querySelector('.nm').style.color = teamCss || trailCss(pilot);
     if (r.newBests && r.newBests.length) {
       const pb = document.createElement('span');
       pb.className = 'pb';
@@ -806,6 +869,7 @@ function onSnapshot(snap) {
     seen.add(p.id);
     if (p.id === game.myId) {
       me.score = p.sc;
+      if (p.tm) game.myTeam = p.tm === 'b' ? 'blue' : 'red';
       me.superUntil = p.su > 0 ? t + p.su : 0;
       me.invuln = Boolean(p.iv);
       if (p.tu > 0) me.tumble = Math.max(me.tumble, p.tu);
@@ -819,6 +883,7 @@ function onSnapshot(snap) {
       const info = game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id };
       const pilot = pilotById(info.pilot);
       const jet = new Jet(pilot, info.name, portraitCanvas(pilot, 64));
+      jet.setTeam(info.team || null);
       jet.group.position.set(p.p[0], p.p[1], p.p[2]);
       jet.group.quaternion.set(p.q[0], p.q[1], p.q[2], p.q[3]);
       gfx.scene.add(jet.group);
@@ -945,6 +1010,30 @@ function onSnapshot(snap) {
     if (!snap.crownHolderId) crown.group.position.lerp(arrToV(snap.crownPos), 0.5);
   }
   if (ribbon) ribbon.setPoints(snap.ribbon || [], t);
+  // Red vs Blue: crown follows its holder (or floats at the loose position)
+  if (teamCrowns && snap.crowns) {
+    for (const team of ['red', 'blue']) {
+      const cm = teamCrowns[team];
+      const sc = snap.crowns[team];
+      if (!cm || !sc) continue;
+      game.teamCrownHolders[team] = sc.h;
+      if (sc.h) {
+        const holderJet = sc.h === game.myId ? me.jet : (remote.get(sc.h) || {}).jet;
+        if (holderJet) cm.group.position.lerp(holderJet.group ? holderJet.group.position : holderJet.position, 0.5);
+        const holderPos = sc.h === game.myId ? me.pos : (remote.get(sc.h) || {}).pos;
+        if (holderPos) {
+          const trail = teamTrails[team];
+          trail.push({ x: holderPos.x, y: holderPos.y - 0.5, z: holderPos.z });
+          if (trail.length > 48) trail.shift();
+          teamRibbons[team].setPoints(trail, t);
+        }
+      } else {
+        cm.group.position.lerp(arrToV(sc.pos), 0.5);
+        teamTrails[team].length = 0;
+        teamRibbons[team].setPoints([], t);
+      }
+    }
+  }
   updateRaceGateHighlight();
   updateBoard(snap);
 }
@@ -973,6 +1062,7 @@ function onHit(e) {
     if (e.mine) addFeed(`Your sky mine struck ${nameOf(e.victim)}!`);
     else addFeed(e.crownStolen ? `You stole the crown from ${nameOf(e.victim)}!` : `Direct hit on ${nameOf(e.victim)}!`);
     if (game.mode === 'blitz') showBanner('+5');
+    else if (game.mode === 'teams') showBanner('+10');
   } else if (e.crownStolen) {
     addFeed(`${nameOf(e.shooter)} ${e.ribbon ? 'flew through the ribbon and' : e.mine ? 'used a mine to' : ''} stole the crown from ${nameOf(e.victim)}`);
   } else if (e.mine) {
@@ -1034,6 +1124,23 @@ function onFinish(e) {
 }
 
 function onCrownEvent(e) {
+  if (e.team) {
+    // Red vs Blue relay
+    game.teamCrownHolders[e.team] = e.holderId;
+    if (e.how === 'dropped') { addFeed(`The ${e.team.toUpperCase()} crown is loose!`); return; }
+    if (e.holderId === game.myId) {
+      sound.fanfare();
+      showBanner(`YOU HAVE THE ${e.team.toUpperCase()} CROWN!`);
+      gfx.addShake(0.25);
+    } else if (e.from) {
+      addFeed(`${nameOf(e.holderId)} stole the ${e.team.toUpperCase()} crown from ${nameOf(e.from)}!`);
+      sound.blip(660, 0.5);
+    } else {
+      addFeed(`${nameOf(e.holderId)} holds the ${e.team.toUpperCase()} crown`);
+      sound.blip(880, 0.5);
+    }
+    return;
+  }
   game.crownHolderId = e.holderId;
   if (e.how === 'dropped') { addFeed('The crown is loose!'); return; }
   if (e.holderId === game.myId) {
@@ -1292,21 +1399,32 @@ let boardHtml = '';
 let eventPillText = '';
 function updateBoard(snap) {
   const race = snap.mode === 'race';
+  const teams = snap.mode === 'teams';
+  // Red vs Blue: live team totals from the per-player snapshot flags
+  const teamScore = { red: 0, blue: 0 };
+  if (teams) {
+    for (const p of snap.players) {
+      if (p.tm === 'r') teamScore.red += p.sc;
+      else if (p.tm === 'b') teamScore.blue += p.sc;
+    }
+  }
   const rows = snap.players
-    .map((p) => ({ id: p.id, sc: p.sc, gi: p.gi, gp: p.gp, fin: p.fin, ...(game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id }) }))
+    .map((p) => ({ id: p.id, sc: p.sc, gi: p.gi, gp: p.gp, fin: p.fin, tm: p.tm, ...(game.names.get(p.id) || { name: 'Pilot', pilot: PILOTS[0].id }) }))
     .sort((a, b) => race
       ? (b.fin - a.fin || b.gp - a.gp || b.sc - a.sc)
       : b.sc - a.sc)
     .slice(0, 8);
   const total = game.course ? game.course.total : 10;
   const html = rows.map((r, i) => {
-    const css = trailCss(pilotById(r.pilot));
+    const css = teams && r.tm ? TEAM_CSS[r.tm === 'b' ? 'blue' : 'red'] : trailCss(pilotById(r.pilot));
     const right = race ? (r.fin ? `🏁 ${r.fin}` : `${Math.min(r.gi !== undefined ? r.gi : total, total)}/${total}`) : r.sc;
-    return `<div class="row${r.id === game.myId ? ' me' : ''}${r.id === snap.crownHolderId ? ' crown' : ''}"><span class="rank">${i + 1}</span><span class="dot" style="background:${css};color:${css}"></span><span class="nm">${escapeHtml(r.name)}</span><span class="sc">${right}</span></div>`;
+    return `<div class="row${r.id === game.myId ? ' me' : ''}${r.id === snap.crownHolderId ? ' crown' : ''}"><span class="rank">${i + 1}</span><span class="dot" style="background:${css};color:${css}"></span><span class="nm"${teams && r.tm ? ` style="color:${css}"` : ''}>${escapeHtml(r.name)}</span><span class="sc">${right}</span></div>`;
   }).join('');
   if (html !== boardHtml) { boardHtml = html; ui.hudBoard.innerHTML = html; }
   if (race) {
     ui.hudCrown.textContent = me.fin ? `🏁 FINISHED ${me.fin}` : `🏁 GATE ${Math.min(me.gi + 1, total)}/${total}`;
+  } else if (teams) {
+    ui.hudCrown.textContent = `🔴 ${teamScore.red} · 🔵 ${teamScore.blue}`;
   } else {
     const holder = snap.crownHolderId ? nameOf(snap.crownHolderId) : (game.mode === 'crown' ? 'loose!' : '');
     ui.hudCrown.textContent = game.mode === 'crown' ? `👑 ${holder}` : `🎈 ${snap.balloons.filter(Boolean).length} left`;
@@ -1504,6 +1622,13 @@ function updateCrownArrow() {
     if (!crown) { ui.crownArrow.classList.add('hidden'); return; }
     if (game.crownHolderId === game.myId) { ui.crownArrow.classList.add('hidden'); return; }
     target = crown.group.position;
+  } else if (game.mode === 'teams') {
+    // Point at the enemy team's crown (steal target); hide while you hold it
+    if (!teamCrowns) { ui.crownArrow.classList.add('hidden'); return; }
+    const enemy = (game.myTeam === 'red') ? 'blue' : 'red';
+    const holder = game.teamCrownHolders[enemy];
+    if (holder === game.myId) { ui.crownArrow.classList.add('hidden'); return; }
+    target = teamCrowns[enemy].group.position;
   } else if (game.mode === 'race') {
     // Point the arrow at your next course gate
     if (!game.course || me.fin) { ui.crownArrow.classList.add('hidden'); return; }

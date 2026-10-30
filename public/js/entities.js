@@ -207,6 +207,14 @@ export class Jet {
     this.label.position.y = 4.6;
     this.group.add(this.label);
 
+    // Red vs Blue team ring (set via setTeam; invisible outside team mode)
+    this.teamRingMat = new THREE.MeshStandardMaterial({ color: 0xff5e5b, emissive: 0xff5e5b, emissiveIntensity: 2.2, transparent: true, opacity: 0.75 });
+    this.teamRing = new THREE.Mesh(geo('teamRing', () => new THREE.TorusGeometry(9.5, 0.45, 6, 40)), this.teamRingMat);
+    this.teamRing.rotation.x = Math.PI / 2;
+    this.teamRing.position.y = -1.2;
+    this.teamRing.visible = false;
+    this.group.add(this.teamRing);
+
     this.exhaustTimer = 0;
     this.tumbleSpin = 0;
     this.trailColors = [new THREE.Color(0xfff2c0), new THREE.Color(trail), new THREE.Color(0x4a4458)];
@@ -218,6 +226,15 @@ export class Jet {
     this.label = makeLabel(name, this.trailCss, this.pilot.callsign, this.portrait);
     this.label.position.y = 4.6;
     this.group.add(this.label);
+  }
+
+  /** Red vs Blue: show this jet's team ring (team = 'red' | 'blue' | null). */
+  setTeam(team) {
+    if (!team) { this.teamRing.visible = false; return; }
+    const hex = team === 'blue' ? 0x47c8ff : 0xff5e5b;
+    this.teamRingMat.color.setHex(hex);
+    this.teamRingMat.emissive.setHex(hex);
+    this.teamRing.visible = true;
   }
 
   /** Ghost power-up: fade every opaque material. */
@@ -261,6 +278,7 @@ export class Jet {
     this.burnerMat.emissive.setHex(info.super ? 0x4ff1ff : 0xff9a2a);
     this.shield.visible = Boolean(info.invuln);
     if (this.shield.visible) { this.shield.rotation.y += dt * 2; this.shield.rotation.x += dt * 1.3; }
+    if (this.teamRing.visible) { this.teamRing.rotation.z += dt * 0.9; this.teamRingMat.emissiveIntensity = 1.8 + Math.sin(time * 4) * 0.6; }
     this.superRing.visible = Boolean(info.super);
     if (this.superRing.visible) this.superRing.rotation.z += dt * 12;
     // Tumble: a harmless 360 spin on hit
@@ -295,6 +313,7 @@ export class Jet {
     this.bubbleMat.dispose();
     this.turboMat.dispose();
     this.rapidMat.dispose();
+    this.teamRingMat.dispose();
     if (this.label.material.map) this.label.material.map.dispose();
     this.label.material.dispose();
   }

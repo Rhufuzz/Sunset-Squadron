@@ -19,7 +19,7 @@ test('constructor creates the file and an empty board shape', () => {
   const { file } = tmpBoard();
   const lb = new Leaderboard(file);
   assert.ok(fs.existsSync(file));
-  assert.deepStrictEqual(lb.board.modes, { crown: {}, blitz: {}, race: {} });
+  assert.deepStrictEqual(lb.board.modes, { crown: {}, blitz: {}, race: {}, teams: {} });
   const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.strictEqual(onDisk.version, 1);
   assert.ok(onDisk.modes);
@@ -122,7 +122,7 @@ test('corrupt file is moved aside and replaced with a fresh board', () => {
   const { file } = tmpBoard();
   fs.writeFileSync(file, '{ this is not json');
   const lb = new Leaderboard(file);
-  assert.deepStrictEqual(lb.board.modes, { crown: {}, blitz: {}, race: {} });
+  assert.deepStrictEqual(lb.board.modes, { crown: {}, blitz: {}, race: {}, teams: {} });
   assert.ok(fs.existsSync(file), 'fresh board written');
   const aside = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.corrupt-'));
   assert.strictEqual(aside.length, 1);
