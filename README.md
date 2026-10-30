@@ -2,12 +2,13 @@
 
 A zero-asset (100 % procedural geometry and audio) multiplayer 3D arcade jet game for up to 8 iPads
 on a shared network. Players join by scanning a QR code in the lobby, pick one of **12 pilot
-characters** (each with a signature jet livery, a procedural portrait and a small perk), then chase
-the Golden Crown, race checkpoint courses or pop balloons and dive through neon ring gates in
-3-minute rounds while grabbing glowing **power-up orbs** — under per-round **weather**. 2–4
-server-flown AI wingmen keep the sky busy even with only two iPads, dropped pilots can reconnect
-mid-round, the host role migrates automatically, and a persistent **all-time leaderboard**
-remembers every human pilot.
+characters** (each with a signature jet livery, a procedural portrait and a small perk), then fly
+**4 game modes** — Crown Tag, Arch & Balloon Blitz, Checkpoint Race and Red vs Blue — in
+3-minute rounds with seeded **mid-round events** (Golden Balloon Rush, Meteor Shower, Frenzy,
+Boss Blimp), glowing **power-up orbs**, per-round **weather**, **style scoring** and **emotes**.
+2–4 server-flown AI wingmen keep the sky busy even with only two iPads, dropped pilots can
+reconnect mid-round, the host role migrates automatically, and a persistent **all-time
+leaderboard** remembers every human pilot.
 
 [![CI](https://github.com/Rhufuzz/Sunset-Squadron/actions/workflows/ci.yml/badge.svg)](https://github.com/Rhufuzz/Sunset-Squadron/actions/workflows/ci.yml)
 
@@ -44,6 +45,7 @@ sunset-squadron/
 | **Crown Tag** (default) | One pilot holds the Golden Crown and earns +1 pt / second. Hit the holder with a firework rocket **or fly through their golden ribbon contrail** to steal it. Stealing grants a 3-second invulnerable speed burst. |
 | **Arch & Balloon Blitz** | 40 glowing hot-air balloons (+10 each, pop by rocket or by flying into them) and 12 stone arches with neon ring gates (+25 and an 8-second 2× **Super-Charge** speed / fire-rate buff). |
 | **Checkpoint Race** | A seeded 10-gate course. Your next gate glows gold (the one after, cyan) and an arrow guides you; fly the gates in order — first to finish scores 100 pts, −15 per rank after that (min 25). Rockets are disabled; barrel rolls still dodge nothing but gravity. |
+| **Red vs Blue** | Team Crown Relay: one crown per team, only the enemy team can steal it (rocket, mine, or slicing the holder's ribbon). Friendly fire is off, hitting an enemy is +10, crown seconds tick for the holder. Team scoreboard, team-tinted jets and contrails. |
 
 Controls on iPad: left half of the screen is a floating virtual stick (it appears wherever your thumb lands),
 right half has **BOOST** (hold = afterburner, tap = barrel roll that deflects rockets) and **FIREWORK**
@@ -103,6 +105,32 @@ Every round is seeded with weather as well as terrain: **☀️ Clear** (no wind
 (~4 % of base speed as a steady crosswind) or **🌧️ Gusty** (~8 %, plus light rain streaks).
 The wind drift applies to every jet server-side, so all players fight the same air; the
 HUD shows the current conditions in a small pill next to the clock.
+
+## Mid-round events
+
+Every round carries one seeded surprise at the ⅓ mark (deterministic per seed, works in
+all modes): **🎈 Golden Balloon Rush** (a 3× gold balloon with 6 HP — burst it for +50 and
+10 s of Score×2), **☄️ Meteor Shower** (18 falling rocks; +5 per near-miss, dodging scores),
+**⚡ Frenzy** (all points ×2, pickups respawn twice as fast, unlimited boost), or
+**☁️ Boss Blimp** (see below). The HUD pill shows the event name and countdown.
+
+## Style scoring
+
+Fly with flair, earn on top of any mode: **CLOSE CALL** +10 (an enemy rocket slips within
+8 m), **LOW RIDER** +15 (3 s below 15 m over the waves), **GATE WEAVE** +25 (barrel roll
+through any gate). Frenzy doubles these too; the HUD stunt ticker calls them out.
+
+## Emotes
+
+A quick-pick emoji bar (keys 1–4 on desktop) floats an emoji over your jet with a
+procedural Animal-Crossing-style chirp — every pilot has their own voice pitch. Bots
+emote when they steal a crown or get hit.
+
+## Boss Blimp
+
+One seeded event pits everyone against a 100 HP procedural airship circling the island.
+Rockets deal 4, mines 6, ramming 3; every 25 HP lost rains 3 power-up orbs; the blimp
+drops slow bombs back. Final blow: +100 and a firework celebration.
 
 ## Leaderboard
 
