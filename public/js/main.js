@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { Graphics, PRESETS } from './graphics.js';
 import { World, islandCollision, WATER_LEVEL, WORLD_RADIUS, CEILING } from './world.js';
-import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
+import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, Meteor, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
 import { Controls } from './controls.js';
 import { SoundEngine } from './audio.js';
 import { PILOTS, PERKS, POWERUPS, pilotById, perkMultipliers, hexCss } from './pilots-data.js';
@@ -78,6 +78,7 @@ const ui = {
   hudMode: $('hud-mode'), hudTimer: $('hud-timer'), hudCrown: $('hud-crown'), hudName: $('hud-name'), hudCallsign: $('hud-callsign'), hudPortrait: $('hud-portrait'), hudScore: $('hud-score'),
   hudStamina: $('hud-stamina'), hudCooldown: $('hud-cooldown'), hudSpeed: $('hud-speed'), hudBoard: $('hud-board'), hudPowerups: $('hud-powerups'),
   hudWeather: $('hud-weather'),
+  hudEvent: $('hud-event'), hudEventText: $('hud-event-text'), hudEventHp: $('hud-event-hp'), hudEventHpFill: $('hud-event-hp-fill'),
   hudFeed: $('hud-feed'), hudBanner: $('hud-banner'), crownArrow: $('crown-arrow'),
   resultsTitle: $('results-title'), resultsList: $('results-list'), resultsBests: $('results-bests'),
   joyBase: $('joy-base'), joyKnob: $('joy-knob'), btnBoost: $('btn-boost'), btnFire: $('btn-fire'),
@@ -116,6 +117,7 @@ const game = {
   crownHolderId: null,
   course: null,            // race mode: { gates: [...], total }
   names: new Map(),        // id -> { name, pilot, isBot }
+  event: null,             // active mid-round event: { type, remain, data }
   attractAngle: 0,
 };
 
@@ -150,8 +152,10 @@ const balloons = new Map(); // id -> { mesh: Balloon, alive }
 const pickups = new Map();  // id -> { mesh: Pickup, alive, type }
 const mines = new Map();    // id -> { mesh: Mine, pos: Vector3 }
 const decoys = new Map();   // id -> { jet: Jet, pos: Vector3, quat: Quaternion, lastAt: number }
+const meteors = new Map();  // id -> { mesh: Meteor } (Meteor Shower event)
 let crown = null;
 let ribbon = null;
+let goldBalloonMesh = null; // Golden Balloon Rush event
 let raceGates = [];        // race mode: [{ group, mat, haloMat, pos }] per course gate
 let raceHiIndex = -1;      // gate index currently highlighted gold
 let lastStateSent = 0;
@@ -507,6 +511,9 @@ function connectSocket() {
     sound.fireworkPop(volumeForDistance(p.distanceTo(me.pos)) * 0.7);
     if (e.by === game.myId) addFeed('Rocket destroyed an enemy decoy!');
   });
+  socket.on('event', (e) => onEventMsg(e));
+  socket.on('eventProgress', (e) => onEventProgress(e));
+  socket.on('closeShave', (e) => onCloseShave(e));
 }
 
 function doJoin() {
@@ -556,6 +563,11 @@ function clearRoundEntities() {
   mines.clear();
   for (const d of decoys.values()) { gfx.scene.remove(d.jet.group); d.jet.dispose(); }
   decoys.clear();
+  for (const m of meteors.values()) { gfx.scene.remove(m.mesh.group); m.mesh.dispose(); }
+  meteors.clear();
+  removeGoldBalloon();
+  hideEventPill();
+  game.event = null;
   if (crown) { gfx.scene.remove(crown.group); crown = null; }
   if (ribbon) { gfx.scene.remove(ribbon.mesh); ribbon = null; }
   for (const g of raceGates) { gfx.scene.remove(g.group); g.mat.dispose(); g.haloMat.dispose(); }
@@ -721,6 +733,9 @@ function endRound(results) {
   ui.touch.classList.add('hidden');
   ui.results.classList.remove('hidden');
   ui.hudPowerups.innerHTML = '';
+  game.event = null;
+  removeGoldBalloon();
+  hideEventPill();
   ui.resultsTitle.textContent = results.results.length && results.results[0].id === game.myId ? 'YOU WIN!' : 'ROUND OVER';
   ui.resultsList.innerHTML = '';
   let myBests = [];
@@ -885,6 +900,35 @@ function onSnapshot(snap) {
   for (const [id, d] of decoys) {
     if (!seenD.has(id)) { gfx.scene.remove(d.jet.group); d.jet.dispose(); decoys.delete(id); }
   }
+  // Meteors (Meteor Shower event)
+  const seenMt = new Set();
+  for (const mk of (snap.meteors || [])) {
+    seenMt.add(mk.id);
+    let m = meteors.get(mk.id);
+    if (!m) {
+      const mesh = new Meteor();
+      mesh.setPosition(mk.p[0], mk.p[1], mk.p[2]);
+      gfx.scene.add(mesh.group);
+      m = { mesh };
+      meteors.set(mk.id, m);
+    }
+    m.mesh.setPosition(mk.p[0], mk.p[1], mk.p[2]);
+  }
+  for (const [id, m] of meteors) {
+    if (!seenMt.has(id)) { gfx.scene.remove(m.mesh.group); m.mesh.dispose(); meteors.delete(id); }
+  }
+  // Active event sync (authoritative countdown + gold balloon hp)
+  if (snap.ev) {
+    if (!game.event || game.event.type !== snap.ev.t) {
+      // Missed the 'event' broadcast (mid-round drop-in): adopt the snapshot state silently
+      game.event = { type: snap.ev.t, remain: snap.ev.e, data: {} };
+      ui.hudEvent.classList.remove('hidden');
+      ui.hudEventText.textContent = `${EVENT_LABEL[snap.ev.t] || snap.ev.t}`;
+      ui.hudEventHp.classList.toggle('hidden', snap.ev.t !== 'balloonRush');
+    }
+    game.event.remain = snap.ev.e;
+    if (typeof snap.ev.hp === 'number' && snap.ev.mh) ui.hudEventHpFill.style.width = `${Math.round((snap.ev.hp / snap.ev.mh) * 100)}%`;
+  }
   // Crown + ribbon
   if (crown) {
     if (!snap.crownHolderId) crown.group.position.lerp(arrToV(snap.crownPos), 0.5);
@@ -911,7 +955,8 @@ function onHit(e) {
   if (e.victim === game.myId) {
     me.tumble = 0.6;
     gfx.addShake(0.9);
-    if (e.mine) addFeed(`${nameOf(e.shooter)}'s sky mine hit you!`);
+    if (e.meteor) addFeed('Meteor strike! You tumbled!');
+    else if (e.mine) addFeed(`${nameOf(e.shooter)}'s sky mine hit you!`);
     else addFeed(e.crownStolen ? `${nameOf(e.shooter)} stole your crown!` : `${nameOf(e.shooter)} tagged you with a firework!`);
   } else if (e.shooter === game.myId) {
     if (e.mine) addFeed(`Your sky mine struck ${nameOf(e.victim)}!`);
@@ -1034,6 +1079,98 @@ function onShieldBreak(e) {
 }
 
 // ---------------------------------------------------------------------------
+// Mid-round events (Golden Balloon Rush / Meteor Shower / Frenzy)
+// ---------------------------------------------------------------------------
+const EVENT_LABEL = {
+  balloonRush: '🎈 GOLDEN BALLOON',
+  meteorShower: '☄️ METEOR SHOWER',
+  frenzy: '⚡ FRENZY',
+};
+const EVENT_FEED = {
+  balloonRush: 'GOLDEN BALLOON spotted — burst it for +50 and 10s of Score x2!',
+  meteorShower: 'METEOR SHOWER — dodge the flaming rocks! +5 per close shave',
+  frenzy: 'FRENZY! Double points everywhere, orbs respawn fast, infinite boost stamina!',
+};
+
+function removeGoldBalloon() {
+  if (goldBalloonMesh) { gfx.scene.remove(goldBalloonMesh.group); goldBalloonMesh = null; }
+}
+
+function hideEventPill() {
+  ui.hudEvent.classList.add('hidden');
+  ui.hudEventHp.classList.add('hidden');
+}
+
+/** Giant gold balloon: the regular Balloon entity scaled 3x with a gold material. */
+function spawnGoldBalloon(pos) {
+  removeGoldBalloon();
+  const mesh = new Balloon(2);   // closest tint to gold, then override the material
+  mesh.group.scale.setScalar(3);
+  mesh.mat.color.setHex(0xffd54a);
+  mesh.mat.emissive.setHex(0xffb613);
+  mesh.mat.emissiveIntensity = 2.2;
+  mesh.setPosition(pos.x, pos.y, pos.z);
+  gfx.scene.add(mesh.group);
+  goldBalloonMesh = mesh;
+}
+
+function onEventMsg(e) {
+  if (!e || !e.type) {
+    game.event = null;
+    removeGoldBalloon();
+    hideEventPill();
+    return;
+  }
+  if (e.type === 'balloonPop') {
+    // The giant balloon burst: gold firework at its position
+    const p = e.p ? arrToV(e.p) : (goldBalloonMesh ? goldBalloonMesh.group.position.clone() : new THREE.Vector3());
+    gfx.particles.burst(p, 70, 40, { colors: GOLD_COLORS, life: 1.6, size: 2.6, gravity: 9 });
+    gfx.particles.burst(p, 30, 20, { colors: FIREWORK_PALETTES[2], life: 1.1, size: 2.0 });
+    gfx.addShake(0.5);
+    sound.eventJingle('balloonPop');
+    if (e.winner === game.myId) showBanner(`GOLDEN BALLOON! +${e.points}`);
+    else addFeed(`${nameOf(e.winner)} burst the Golden Balloon (+${e.points})`);
+    game.event = null;
+    removeGoldBalloon();
+    hideEventPill();
+    return;
+  }
+  game.event = {
+    type: e.type,
+    remain: e.endsAt ? Math.max(0, (e.endsAt - Date.now() - game.serverOffset) / 1000) : 0,
+    data: e.data || {},
+  };
+  ui.hudEvent.classList.remove('hidden');
+  ui.hudEventText.textContent = `${EVENT_LABEL[e.type] || e.type}`;
+  ui.hudEventHp.classList.toggle('hidden', e.type !== 'balloonRush');
+  if (e.type === 'balloonRush') {
+    spawnGoldBalloon(e.data.pos || e.pos || { x: 0, y: 120, z: 0 });
+    if (typeof e.hp === 'number') ui.hudEventHpFill.style.width = `${Math.round((e.hp / (e.maxHp || 6)) * 100)}%`;
+  }
+  sound.eventJingle(e.type);
+  addFeed(EVENT_FEED[e.type] || e.type);
+  showBanner(`${EVENT_LABEL[e.type] || e.type}!`);
+  gfx.addShake(0.2);
+}
+
+function onEventProgress(e) {
+  if (typeof e.hp === 'number' && typeof e.maxHp === 'number') {
+    ui.hudEventHpFill.style.width = `${Math.round(Math.max(0, e.hp / e.maxHp) * 100)}%`;
+  }
+}
+
+function onCloseShave(e) {
+  if (e.id === game.myId) {
+    sound.closeShave();
+    showBanner(`CLOSE SHAVE +${e.points}`);
+    addFeed('Meteor close shave! +5');
+    gfx.addShake(0.15);
+  } else {
+    addFeed(`${nameOf(e.id)} grazed a meteor (+${e.points})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HUD helpers
 // ---------------------------------------------------------------------------
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -1058,6 +1195,7 @@ function showBanner(text) {
 }
 
 let boardHtml = '';
+let eventPillText = '';
 function updateBoard(snap) {
   const race = snap.mode === 'race';
   const rows = snap.players
@@ -1142,8 +1280,10 @@ function stepLocalFlight(dt) {
   }
   const sup = t < me.superUntil;
   const turbo = hasFx('turbo');
+  const frenzy = game.event && game.event.type === 'frenzy';
   const regen = 0.28 * game.perk.stamRegen;
-  if (turbo) { boost = true; me.stamina = Math.min(1, me.stamina + dt * regen); }
+  if (frenzy) { me.stamina = 1; }   // Frenzy: infinite boost stamina
+  else if (turbo) { boost = true; me.stamina = Math.min(1, me.stamina + dt * regen); }
   else if (boost && me.stamina > 0.02) me.stamina = Math.max(0, me.stamina - dt * 0.45 * (game.perk.stamDrain || 1));
   else { boost = false; me.stamina = Math.min(1, me.stamina + dt * regen); }
   if (boost && !me.wasBoosting) sound.boostWhoosh(0.8);
@@ -1211,6 +1351,15 @@ function stepLocalFlight(dt) {
     if (socket) socket.emit('fire');
     sound.fireworkLaunch();
     gfx.addShake(0.12);
+  }
+  // Event pill countdown
+  if (game.event && game.event.remain > 0) {
+    game.event.remain = Math.max(0, game.event.remain - dt);
+    const txt = `${EVENT_LABEL[game.event.type] || game.event.type} ${formatTime(game.event.remain)}`;
+    if (txt !== eventPillText) {
+      eventPillText = txt;
+      ui.hudEventText.textContent = txt;
+    }
   }
 
   // Camera: chase behind, ignoring roll so the horizon stays readable
@@ -1304,6 +1453,8 @@ function stepRemote(dt) {
     r.mesh.update(dt, gfx.particles);
   }
   for (const b of balloons.values()) if (b.alive) b.mesh.update(dt, t);
+  for (const m of meteors.values()) m.mesh.update(dt, gfx.particles);
+  if (goldBalloonMesh) goldBalloonMesh.update(dt, t);
   for (const k of pickups.values()) if (k.alive) k.mesh.update(dt, t, k.mesh.group.position.distanceTo(gfx.camera.position) < 350 ? gfx.particles : null);
   if (crown) {
     const holderId = game.crownHolderId;

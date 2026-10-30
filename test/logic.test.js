@@ -41,6 +41,56 @@ test('generateWeather: different seeds produce varied weather over a sweep', () 
   assert.deepStrictEqual([...types].sort(), [...logic.WEATHER_TYPES].sort());
 });
 
+test('generateEvent: same seed -> identical type, timing and data over 100 seeds', () => {
+  for (let seed = 0; seed < 100; seed++) {
+    const a = logic.generateEvent(seed, 180);
+    const b = logic.generateEvent(seed, 180);
+    assert.deepStrictEqual(a, b, `seed ${seed} must be deterministic`);
+  }
+});
+
+test('generateEvent: valid types only, timing inside the round, sane data shape', () => {
+  for (let seed = 0; seed < 100; seed++) {
+    const e = logic.generateEvent(seed * 7919, 180);
+    assert.ok(logic.EVENT_TYPES.includes(e.type), `type ${e.type} is known`);
+    assert.ok(e.atS > 0 && e.atS < 180, `start ${e.atS} within the round`);
+    assert.ok(e.durS > 0 && e.atS + e.durS <= 180, `dur ${e.durS} fits after start`);
+    if (e.type === 'balloonRush') {
+      assert.strictEqual(e.data.hp, logic.EVENT_BALLOON_HP);
+      assert.ok(e.data.pos.y >= 95 && e.data.pos.y <= 150);
+      assert.ok(Math.hypot(e.data.pos.x, e.data.pos.z) < 120, 'balloon hovers over the central island');
+    } else if (e.type === 'meteorShower') {
+      assert.strictEqual(e.data.count, 18);
+      assert.ok(e.data.interval >= 0.5);
+      assert.strictEqual(e.data.meteors.length, 18);
+      for (const m of e.data.meteors) {
+        assert.ok(m.y > 300 && m.y < 420, `meteor starts above CEILING (y=${m.y})`);
+        const vlen = Math.hypot(m.vx, m.vy, m.vz);
+        assert.ok(Math.abs(vlen - 25) < 0.01, `velocity ~25 u/s (got ${vlen})`);
+        assert.ok(m.vy < 0, 'meteors fall toward the ground');
+      }
+    } else {
+      assert.strictEqual(e.data.mult, 2);
+    }
+  }
+});
+
+test('generateEvent: short (test) rounds clamp start and duration inside the round', () => {
+  for (const rl of [25, 30, 45]) {
+    for (let seed = 0; seed < 20; seed++) {
+      const e = logic.generateEvent(seed, rl);
+      assert.ok(e.atS > 0 && e.atS < rl);
+      assert.ok(e.atS + e.durS <= rl);
+    }
+  }
+});
+
+test('generateEvent: all three event types occur over a seed sweep', () => {
+  const types = new Set();
+  for (let seed = 0; seed < 300; seed++) types.add(logic.generateEvent(seed, 180).type);
+  assert.deepStrictEqual([...types].sort(), [...logic.EVENT_TYPES].sort());
+});
+
 test('vector helpers: clamp, lerp, wrapAngle, rounding', () => {
   assert.strictEqual(logic.clamp(5, 0, 3), 3);
   assert.strictEqual(logic.clamp(-5, 0, 3), 0);

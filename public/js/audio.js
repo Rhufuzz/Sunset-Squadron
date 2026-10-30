@@ -472,4 +472,109 @@ export class SoundEngine {
       o.stop(st + 0.6);
     });
   }
+
+  /** Mid-round event start jingle — a distinct motif per event type. */
+  eventJingle(type, volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    if (type === 'balloonRush') {
+      // Triumphant rising fanfare with a sparkle tail
+      [NOTE.C5, NOTE.E5, NOTE.G5, 1046.5, 1318.5].forEach((f, i) => {
+        const st = t + i * 0.09;
+        const o = ctx.createOscillator();
+        o.type = 'square';
+        o.frequency.value = f;
+        const g = ctx.createGain();
+        this._env(g, st, 0.12 * volume, 0.01, 0.5);
+        o.connect(g).connect(this.master);
+        o.start(st);
+        o.stop(st + 0.55);
+        const shimmer = ctx.createOscillator();
+        shimmer.type = 'sine';
+        shimmer.frequency.value = f * 2;
+        const sg = ctx.createGain();
+        this._env(sg, st, 0.05 * volume, 0.01, 0.4);
+        shimmer.connect(sg).connect(this.master);
+        shimmer.start(st);
+        shimmer.stop(st + 0.45);
+      });
+    } else if (type === 'meteorShower') {
+      // Ominous: low rumble sweep + descending minor notes
+      const rumble = this._noiseSource(false);
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(600, t);
+      lp.frequency.exponentialRampToValueAtTime(120, t + 1.1);
+      const rg = ctx.createGain();
+      this._env(rg, t, 0.3 * volume, 0.05, 1.0);
+      rumble.connect(lp).connect(rg).connect(this.master);
+      rumble.start(t);
+      rumble.stop(t + 1.2);
+      [440, 349.23, 293.66].forEach((f, i) => {
+        const st = t + 0.15 + i * 0.22;
+        const o = ctx.createOscillator();
+        o.type = 'sawtooth';
+        o.frequency.setValueAtTime(f, st);
+        o.frequency.exponentialRampToValueAtTime(f * 0.85, st + 0.3);
+        const g = ctx.createGain();
+        this._env(g, st, 0.12 * volume, 0.02, 0.4);
+        o.connect(g).connect(this.master);
+        o.start(st);
+        o.stop(st + 0.45);
+      });
+    } else if (type === 'frenzy') {
+      // Frantic fast up-down riff
+      [NOTE.C5, NOTE.E5, NOTE.G5, NOTE.E5, NOTE.C5, NOTE.G5, NOTE.B5, NOTE.D6].forEach((f, i) => {
+        const st = t + i * 0.07;
+        const o = ctx.createOscillator();
+        o.type = 'square';
+        o.frequency.value = f;
+        const g = ctx.createGain();
+        this._env(g, st, 0.11 * volume, 0.005, 0.18);
+        o.connect(g).connect(this.master);
+        o.start(st);
+        o.stop(st + 0.22);
+      });
+    } else if (type === 'balloonPop') {
+      // Golden balloon burst: big pop + victory arpeggio
+      this.fireworkPop(volume);
+      [NOTE.C5, NOTE.G5, NOTE.D6, NOTE.D6 * 1.25].forEach((f, i) => {
+        const st = t + 0.15 + i * 0.1;
+        const o = ctx.createOscillator();
+        o.type = 'triangle';
+        o.frequency.value = f;
+        const g = ctx.createGain();
+        this._env(g, st, 0.16 * volume, 0.01, 0.45);
+        o.connect(g).connect(this.master);
+        o.start(st);
+        o.stop(st + 0.5);
+      });
+    }
+  }
+
+  /** Close shave: a rocket-rock whoosh whipping past the canopy. */
+  closeShave(volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const n = this._noiseSource(false);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(2400, t);
+    bp.frequency.exponentialRampToValueAtTime(300, t + 0.3);
+    bp.Q.value = 1.8;
+    const g = ctx.createGain();
+    this._env(g, t, 0.22 * volume, 0.01, 0.3);
+    n.connect(bp).connect(g).connect(this.master);
+    n.start(t);
+    n.stop(t + 0.35);
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(980, t);
+    o.frequency.exponentialRampToValueAtTime(520, t + 0.2);
+    const og = ctx.createGain();
+    this._env(og, t, 0.1 * volume, 0.01, 0.22);
+    o.connect(og).connect(this.master);
+    o.start(t);
+    o.stop(t + 0.25);
+  }
 }

@@ -274,6 +274,10 @@ html, body {
 @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.06); } }
 #hud-crown { color: var(--gold); }
 #hud-weather { font-size: 13px; color: rgba(255, 246, 232, 0.9); }
+.event-pill { font-size: 13px; color: var(--gold); border-color: rgba(255, 213, 74, 0.55); animation: pulse 1.1s infinite alternate; }
+.event-hp { display: inline-block; width: 44px; height: 6px; margin-left: 8px; border-radius: 3px; background: rgba(0, 0, 0, 0.35); overflow: hidden; vertical-align: middle; }
+.event-hp.hidden { display: none; }
+#hud-event-hp-fill { display: block; height: 100%; width: 100%; background: linear-gradient(90deg, #ffd54a, #fff6c0); border-radius: 3px; }
 
 .hud-left {
   position: absolute;

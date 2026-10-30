@@ -776,3 +776,45 @@ export class Mine {
     this.mat.dispose();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Meteor (Meteor Shower event): flaming rock with a fire trail
+// ---------------------------------------------------------------------------
+export class Meteor {
+  constructor() {
+    this.group = new THREE.Group();
+    this.mat = new THREE.MeshStandardMaterial({ color: 0x5a4634, emissive: 0xff5a1a, emissiveIntensity: 2.6, flatShading: true, roughness: 0.9 });
+    const rock = new THREE.Mesh(geo('meteorRock', () => new THREE.IcosahedronGeometry(2.6, 0)), this.mat);
+    rock.castShadow = true;
+    this.group.add(rock);
+    this.fireMat = new THREE.MeshStandardMaterial({ color: 0xffd27a, emissive: 0xff8c2a, emissiveIntensity: 3.2, transparent: true, opacity: 0.85, depthWrite: false });
+    const fire = new THREE.Mesh(geo('meteorFire', () => { const g = new THREE.ConeGeometry(1.6, 4.4, 5); g.rotateX(Math.PI / 2); return g; }), this.fireMat);
+    fire.position.z = 3.0;
+    this.group.add(fire);
+    this.trailTimer = 0;
+    this.colors = [new THREE.Color(0xfff1a8), new THREE.Color(0xff8c2a), new THREE.Color(0x8a2b0a)];
+  }
+
+  setPosition(x, y, z) {
+    this.group.position.set(x, y, z);
+  }
+
+  update(dt, particles) {
+    this.group.rotation.x += dt * 2.2;
+    this.group.rotation.y += dt * 1.6;
+    this.trailTimer -= dt;
+    if (particles && this.trailTimer <= 0) {
+      this.trailTimer = 0.04;
+      particles.spawn({
+        pos: this.group.position,
+        vel: { x: (Math.random() - 0.5) * 4, y: (Math.random() - 0.5) * 4, z: (Math.random() - 0.5) * 4 },
+        life: 0.6, size: 1.4, drag: 1.1, colors: this.colors, glow: 2.2,
+      });
+    }
+  }
+
+  dispose() {
+    this.mat.dispose();
+    this.fireMat.dispose();
+  }
+}

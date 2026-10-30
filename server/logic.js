@@ -94,6 +94,63 @@ function generateWeather(seed) {
 }
 
 // ---------------------------------------------------------------------------
+// Mid-round events (seeded per round, all modes)
+// ---------------------------------------------------------------------------
+const EVENT_TYPES = ['balloonRush', 'meteorShower', 'frenzy'];
+const EVENT_DURATIONS = { balloonRush: 60, meteorShower: 45, frenzy: 60 };
+const EVENT_AT_S = 60;                // fires ~60s into a full-length round
+const EVENT_BALLOON_HP = 6;           // rocket hits needed to burst the golden balloon
+const EVENT_METEOR_COUNT = 18;        // meteors spawned over the meteorShower window
+const EVENT_METEOR_SPEED = 25;        // u/s, matches the server integration step
+// Mirror the server world constants (logic.js stays dependency-free).
+const EVENT_CEILING = 260;
+const EVENT_WORLD_RADIUS = 920;       // keep ground targets inside the playfield
+
+/**
+ * Pure per-round event planner: same seed -> same type, timing and spawn data.
+ * Returns { type, atS, durS, data }:
+ *   balloonRush  data: { pos:{x,y,z}, hp }         giant gold balloon spawn
+ *   meteorShower data: { count, interval, meteors } start pos + velocity per meteor
+ *   frenzy       data: { mult }                    global score multiplier
+ * Short (test) rounds scale the start time and duration so the event still fits.
+ */
+function generateEvent(seed, roundLength = 180) {
+  const rand = mulberry32((seed ^ 0x3ee7dada) >>> 0);
+  const rl = Math.max(10, roundLength || 180);
+  const type = EVENT_TYPES[Math.floor(rand() * EVENT_TYPES.length)];
+  const atS = Math.round(Math.min(EVENT_AT_S, rl / 3) * 10) / 10;
+  const durS = Math.round(Math.min(EVENT_DURATIONS[type], Math.max(5, rl - atS)) * 10) / 10;
+  let data = {};
+  if (type === 'balloonRush') {
+    // Hover above the central island so it is reachable from anywhere
+    const ang = rand() * Math.PI * 2;
+    const d = 25 + rand() * 85;
+    data = {
+      pos: { x: r2(Math.cos(ang) * d), y: r2(95 + rand() * 55), z: r2(Math.sin(ang) * d) },
+      hp: EVENT_BALLOON_HP,
+    };
+  } else if (type === 'meteorShower') {
+    const meteors = [];
+    for (let i = 0; i < EVENT_METEOR_COUNT; i++) {
+      // Seeded ground target inside the world, start high above the ceiling
+      const ang = rand() * Math.PI * 2;
+      const d = 80 + rand() * (EVENT_WORLD_RADIUS - 160);
+      const tx = Math.cos(ang) * d;
+      const tz = Math.sin(ang) * d;
+      const sx = tx + (rand() - 0.5) * 300;
+      const sz = tz + (rand() - 0.5) * 300;
+      const sy = 320 + rand() * 90;   // above CEILING (260)
+      const v = vscale(vnorm({ x: tx - sx, y: -sy, z: tz - sz }), EVENT_METEOR_SPEED);
+      meteors.push({ x: r2(sx), y: r2(sy), z: r2(sz), vx: r2(v.x), vy: r2(v.y), vz: r2(v.z) });
+    }
+    data = { count: EVENT_METEOR_COUNT, interval: r2(Math.max(0.5, (durS - 4) / EVENT_METEOR_COUNT)), meteors };
+  } else {
+    data = { mult: 2 };
+  }
+  return { type, atS, durS, data };
+}
+
+// ---------------------------------------------------------------------------
 // Homing cone math
 // ---------------------------------------------------------------------------
 
@@ -154,6 +211,7 @@ module.exports = {
   clamp, lerp, vlen, vsub, vdot, vnorm, vscale, vadd, dist, r2, r3,
   islandCollision,
   WEATHER_TYPES, WEATHER_LABELS, generateWeather,
+  EVENT_TYPES, EVENT_DURATIONS, EVENT_AT_S, EVENT_BALLOON_HP, generateEvent,
   homingAngle,
   RACE_FINISH_BASE, RACE_FINISH_STEP, RACE_FINISH_MIN, raceFinishPoints,
   gateCrossing, compareRaceResults,
