@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { Graphics, PRESETS } from './graphics.js';
 import { World, islandCollision, WATER_LEVEL, WORLD_RADIUS, CEILING } from './world.js';
-import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, Meteor, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
+import { Jet, Crown, Ribbon, Balloon, Rocket, Pickup, Mine, Meteor, makeEmojiSprite, powerupPalette, FIREWORK_PALETTES, SPLASH_COLORS, GOLD_COLORS, SHIELD_COLORS } from './entities.js';
 import { Controls } from './controls.js';
 import { SoundEngine } from './audio.js';
 import { PILOTS, PERKS, POWERUPS, pilotById, perkMultipliers, hexCss } from './pilots-data.js';
@@ -79,9 +79,10 @@ const ui = {
   hudStamina: $('hud-stamina'), hudCooldown: $('hud-cooldown'), hudSpeed: $('hud-speed'), hudBoard: $('hud-board'), hudPowerups: $('hud-powerups'),
   hudWeather: $('hud-weather'),
   hudEvent: $('hud-event'), hudEventText: $('hud-event-text'), hudEventHp: $('hud-event-hp'), hudEventHpFill: $('hud-event-hp-fill'),
-  hudFeed: $('hud-feed'), hudBanner: $('hud-banner'), crownArrow: $('crown-arrow'),
+  hudFeed: $('hud-feed'), hudStunts: $('hud-stunts'), hudBanner: $('hud-banner'), crownArrow: $('crown-arrow'),
   resultsTitle: $('results-title'), resultsList: $('results-list'), resultsBests: $('results-bests'),
   joyBase: $('joy-base'), joyKnob: $('joy-knob'), btnBoost: $('btn-boost'), btnFire: $('btn-fire'),
+  emoteBar: $('emote-bar'),
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,7 @@ const ui = {
 const gfx = new Graphics($('game-canvas'));
 const sound = new SoundEngine();
 const controls = new Controls(ui.touch, ui.joyBase, ui.joyKnob, ui.btnBoost, ui.btnFire);
+wireEmotes();
 let world = null;
 let socket = null;
 
@@ -514,6 +516,8 @@ function connectSocket() {
   socket.on('event', (e) => onEventMsg(e));
   socket.on('eventProgress', (e) => onEventProgress(e));
   socket.on('closeShave', (e) => onCloseShave(e));
+  socket.on('style', (e) => onStyle(e));
+  socket.on('emote', (e) => onEmote(e));
 }
 
 function doJoin() {
@@ -565,6 +569,12 @@ function clearRoundEntities() {
   decoys.clear();
   for (const m of meteors.values()) { gfx.scene.remove(m.mesh.group); m.mesh.dispose(); }
   meteors.clear();
+  for (const sprite of emoteSprites.keys()) {
+    gfx.scene.remove(sprite);
+    if (sprite.material.map) sprite.material.map.dispose();
+    sprite.material.dispose();
+  }
+  emoteSprites.clear();
   removeGoldBalloon();
   hideEventPill();
   game.event = null;
@@ -575,6 +585,7 @@ function clearRoundEntities() {
   raceHiIndex = -1;
   game.course = null;
   ui.hudFeed.innerHTML = '';
+  ui.hudStunts.innerHTML = '';
   ui.hudPowerups.innerHTML = '';
   me.fx = {};
   puHtml = '';
@@ -1171,6 +1182,89 @@ function onCloseShave(e) {
 }
 
 // ---------------------------------------------------------------------------
+// Style scoring (close calls / low rider / gate weave)
+// ---------------------------------------------------------------------------
+const STYLE_LABEL = { closeCall: 'CLOSE CALL', lowRider: 'LOW RIDER', gateWeave: 'GATE WEAVE' };
+
+function onStyle(e) {
+  const label = STYLE_LABEL[e.kind] || e.kind;
+  if (e.id === game.myId) {
+    sound.styleStunt(e.kind);
+    showBanner(`${label} +${e.points}`);
+  }
+  addStunt(e.id === game.myId ? `${label} +${e.points}` : `${nameOf(e.id)} · ${label} +${e.points}`);
+}
+
+/** Stunt ticker: top-right stack, newest first, last 4 kept, fades out via CSS. */
+function addStunt(text) {
+  const el = document.createElement('div');
+  el.className = 'stunt';
+  el.textContent = text;
+  ui.hudStunts.prepend(el);
+  while (ui.hudStunts.children.length > 4) ui.hudStunts.removeChild(ui.hudStunts.lastChild);
+  setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 3200);
+}
+
+// ---------------------------------------------------------------------------
+// Emotes + pilot chatter
+// ---------------------------------------------------------------------------
+const emoteSprites = new Map();   // sprite -> until (performance.now()/1000)
+let lastEmoteSent = -99;
+
+/** Floating emoji above the sender's jet for 3s + procedural gibberish voice chirp. */
+function onEmote(e) {
+  const sprite = makeEmojiSprite(e.emoji);
+  sprite.position.set(e.p[0], e.p[1] + 6, e.p[2]);
+  gfx.scene.add(sprite);
+  emoteSprites.set(sprite, nowS() + 3);
+  const info = game.names.get(e.id);
+  const pilotIdx = Math.max(0, PILOTS.findIndex((p) => p.id === (info ? info.pilot : game.pilotId)));
+  sound.pilotChatter(pilotIdx, e.id === game.myId ? 1 : volumeForDistance(distToMe(e.p)));
+}
+
+function sendEmote(emoji) {
+  if (!socket || !game.joined) return;
+  const t = nowS();
+  if (t - lastEmoteSent < 5) return;   // mirror of the server's 5s rate limit
+  lastEmoteSent = t;
+  socket.emit('emote', { emoji });
+  sound.pilotChatter(PILOTS.findIndex((p) => p.id === game.pilotId), 1);
+}
+
+function wireEmotes() {
+  for (const btn of ui.emoteBar.children) {
+    btn.addEventListener('click', () => sendEmote(btn.dataset.emoji));
+    btn.addEventListener('touchend', (e) => { e.preventDefault(); sendEmote(btn.dataset.emoji); }, { passive: false });
+  }
+  // Desktop: keys 1-4 pick the first four emotes
+  window.addEventListener('keydown', (e) => {
+    if (game.phase !== 'playing') return;
+    const idx = ['1', '2', '3', '4'].indexOf(e.key);
+    if (idx >= 0 && ui.emoteBar.children[idx]) {
+      e.preventDefault();
+      sendEmote(ui.emoteBar.children[idx].dataset.emoji);
+    }
+  });
+}
+
+/** Float + fade the active emote sprites. */
+function stepEmotes(dt) {
+  const t = nowS();
+  for (const [sprite, until] of emoteSprites) {
+    const remain = until - t;
+    if (remain <= 0) {
+      gfx.scene.remove(sprite);
+      if (sprite.material.map) sprite.material.map.dispose();
+      sprite.material.dispose();
+      emoteSprites.delete(sprite);
+      continue;
+    }
+    sprite.position.y += dt * 2.5;
+    sprite.material.opacity = Math.min(1, remain / 0.6);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HUD helpers
 // ---------------------------------------------------------------------------
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -1490,6 +1584,7 @@ function frame(nowMs) {
   if (game.phase === 'playing') {
     stepLocalFlight(dt);
     stepRemote(dt);
+    stepEmotes(dt);
     if (game.weather && game.weather.type === 'gusty') {
       const wx = game.weather.wind.x || 0, wz = game.weather.wind.z || 0;
       for (let i = 0; i < 3; i++) {
@@ -1519,6 +1614,7 @@ function frame(nowMs) {
     }
   } else if (game.phase === 'ended') {
     stepRemote(dt);
+    stepEmotes(dt);
     if (me.jet) { me.jet.group.position.copy(me.pos); me.jet.updateVisual(dt, { boost: false, super: false, invuln: false, tumble: 0 }, gfx.particles, nowS()); }
     gfx.camera.position.lerp(tmpV.copy(me.pos).add(tmpV2.set(0, 30, 50)), 0.02);
     gfx.camera.lookAt(me.pos);
@@ -1535,6 +1631,7 @@ function frame(nowMs) {
 async function boot() {
   buildPickers();
   wireLobby();
+  wireEmotes();
   const info = await loadHostInfo();
   loadLeaderboard();
   buildWorld(info ? info.seed : 1337);

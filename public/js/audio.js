@@ -577,4 +577,89 @@ export class SoundEngine {
     o.start(t);
     o.stop(t + 0.25);
   }
+
+  /** Style-scoring stings: whoosh for close calls, surf glide for low rider, crowd chant for gate weave. */
+  styleStunt(kind, volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    if (kind === 'lowRider') {
+      // Low gliding sine skimming the swell
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(420, t);
+      o.frequency.exponentialRampToValueAtTime(160, t + 0.35);
+      o.frequency.exponentialRampToValueAtTime(330, t + 0.6);
+      const g = ctx.createGain();
+      this._env(g, t, 0.18 * volume, 0.03, 0.6);
+      o.connect(g).connect(this.master);
+      o.start(t);
+      o.stop(t + 0.65);
+      return;
+    }
+    if (kind === 'gateWeave') {
+      // Crowd chant: three punchy notes over a swelling noise bed
+      [NOTE.C5, NOTE.E5, NOTE.G5].forEach((f, i) => {
+        const st = t + i * 0.09;
+        const o = ctx.createOscillator();
+        o.type = 'square';
+        o.frequency.value = f;
+        const g = ctx.createGain();
+        this._env(g, st, 0.12 * volume, 0.01, 0.2);
+        o.connect(g).connect(this.master);
+        o.start(st);
+        o.stop(st + 0.25);
+      });
+      const crowd = this._noiseSource(false);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(900, t);
+      bp.frequency.exponentialRampToValueAtTime(1800, t + 0.4);
+      bp.Q.value = 1.2;
+      const g = ctx.createGain();
+      this._env(g, t, 0.12 * volume, 0.05, 0.45);
+      crowd.connect(bp).connect(g).connect(this.master);
+      crowd.start(t);
+      crowd.stop(t + 0.55);
+      return;
+    }
+    // closeCall: razor whoosh whipping past the canopy
+    const n = this._noiseSource(false);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(600, t);
+    bp.frequency.exponentialRampToValueAtTime(3200, t + 0.22);
+    bp.Q.value = 2.2;
+    const g = ctx.createGain();
+    this._env(g, t, 0.2 * volume, 0.01, 0.28);
+    n.connect(bp).connect(g).connect(this.master);
+    n.start(t);
+    n.stop(t + 0.35);
+  }
+
+  /**
+   * Pilot chatter: procedural gibberish "voice" for emotes, Animal-Crossing style.
+   * 3-6 short notes; the pitch base shifts per pilot so every pilot sounds distinct.
+   */
+  pilotChatter(pilotIndex = 0, volume = 1) {
+    if (!this.ctx || this.muted) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const base = 240 + ((pilotIndex * 47) % 220);   // 240-459 Hz, unique-ish per pilot
+    const scale = [1, 1.125, 1.25, 1.335, 1.5, 1.685, 1.875];   // major-ish steps
+    const n = 3 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < n; i++) {
+      const st = t + i * 0.075;
+      const f = base * scale[Math.floor(Math.random() * scale.length)] * (Math.random() < 0.5 ? 1 : 2);
+      const o = ctx.createOscillator();
+      o.type = 'square';
+      o.frequency.setValueAtTime(f, st);
+      o.frequency.exponentialRampToValueAtTime(f * (0.9 + Math.random() * 0.2), st + 0.06);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, st);
+      g.gain.exponentialRampToValueAtTime(0.09 * volume, st + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, st + 0.07);
+      o.connect(g).connect(this.master);
+      o.start(st);
+      o.stop(st + 0.09);
+    }
+  }
 }

@@ -372,6 +372,25 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+/** Floating emote: a big emoji drawn onto a canvas sprite (name-tag rendering approach). */
+export function makeEmojiSprite(emoji) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.font = '92px -apple-system, Segoe UI, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(emoji, 64, 70);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(7, 7, 1);
+  sprite.renderOrder = 6;
+  return sprite;
+}
+
 // ---------------------------------------------------------------------------
 // Golden Crown
 // ---------------------------------------------------------------------------

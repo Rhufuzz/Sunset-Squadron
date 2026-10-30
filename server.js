@@ -77,6 +77,22 @@ const GOLD_BALLOON_R = 15;           // giant gold balloon collision radius
 const GOLD_FLYIN_SPEED = 30;         // min speed to burst it by flying into it
 const SHAVE_THROTTLE_S = 1;          // min seconds between closeShave awards per jet
 
+// Style scoring (all modes, stacked on top of the regular scoring)
+const STYLE_CLOSE_CALL_PTS = 10;     // enemy rocket passes within...
+const STYLE_CLOSE_CALL_R = 8;        // ...this many metres without connecting
+const STYLE_CLOSE_CALL_THROTTLE_S = 2;  // max one close-call award per jet per 2s
+const STYLE_LOW_RIDER_PTS = 15;      // sustained flight below...
+const STYLE_LOW_RIDER_ALT = 15;      // ...this altitude over water for...
+const STYLE_LOW_RIDER_SUSTAIN_S = 3; // ...this many continuous seconds...
+const STYLE_LOW_RIDER_COOLDOWN_S = 10;  // ...award repeat no faster than this
+const STYLE_GATE_WEAVE_PTS = 25;     // barrel roll while passing through a gate
+
+// Emotes / pilot chatter
+const EMOTE_COOLDOWN_S = 5;          // server-side rate limit per player (excess silently dropped)
+const EMOTE_WHITELIST = ['😄', '😂', '😮', '😍', '😎', '🤪', '😡', '🎉', '👑', '💪', '🚀', '💥'];
+const BOT_HIT_EMOTES = ['😡', '💥', '🤪'];
+const BOT_CROWN_EMOTES = ['👑', '😎', '🎉'];
+
 const BOT_NAMES = ['Wingman Ace', 'Wingman Duke', 'Wingman Pip', 'Wingman Zed'];
 const leaderboard = new Leaderboard();
 const PRESETS = ['sunset', 'noon', 'twilight'];
@@ -296,6 +312,10 @@ function makePlayer(id, name, pilot, isBot) {
     superUntil: 0,
     lastFire: 0,
     lastSeen: now(),
+    lastCloseCallAt: 0,           // style: last close-call award time
+    lowSince: 0,                  // style: when the current below-15m run started
+    lastLowAward: 0,              // style: last low-rider award time
+    lastEmoteAt: 0,               // emote rate-limit timestamp (bots use it too)
     clientId: null,               // stable per-browser id (localStorage 'sq_client_id') for mid-round reconnect
     gone: false,                  // disconnected mid-round; seat held for DISCONNECT_GRACE_S
     goneAt: 0,
@@ -324,6 +344,10 @@ function spawnPlayer(p, index, total) {
   p.score = 0;
   p.rollingUntil = 0; p.tumbleUntil = 0; p.invulnUntil = 0; p.burstUntil = 0; p.superUntil = 0;
   p.lastFire = 0;
+  p.lastCloseCallAt = 0;
+  p.lowSince = 0;
+  p.lastLowAward = 0;
+  p.lastEmoteAt = 0;
   p.gateSide = {};
   p.gateCooldown = {};
   p.race = { gateIndex: 0, gatesPassed: 0, finished: false, finishRank: 0, finishTime: 0 };
@@ -364,6 +388,12 @@ function awardPoints(p, amount, t) {
   const amt = amount * pointMult();
   addScore(p, amt, t);
   return amt;
+}
+/** Style award: goes through awardPoints (Frenzy doubles it) and announces a 'style' event. */
+function awardStyle(p, kind, base, t) {
+  const pts = awardPoints(p, base, t);
+  io.emit('style', { kind, points: Math.round(pts), id: p.id });
+  return pts;
 }
 function publicPlayer(p) {
   return { id: p.id, name: p.name, pilot: p.pilot, isBot: p.isBot, gone: Boolean(p.gone), score: Math.round(p.score) };
@@ -996,6 +1026,16 @@ io.on('connection', (socket) => {
     io.emit('roll', { id: player.id });
   });
 
+  socket.on('emote', (data) => {
+    if (!player || state.phase !== 'playing') return;
+    const emoji = data && typeof data.emoji === 'string' ? data.emoji : '';
+    if (!emoji || emoji.length > 8 || !EMOTE_WHITELIST.includes(emoji)) return;   // whitelist: silently reject
+    const t = now();
+    if (t - player.lastEmoteAt < EMOTE_COOLDOWN_S) return;                        // rate limit: silently drop
+    player.lastEmoteAt = t;
+    io.emit('emote', { id: player.id, emoji, p: [r2(player.pos.x), r2(player.pos.y), r2(player.pos.z)] });
+  });
+
   socket.on('disconnect', () => detachPlayer(player));
 
   socket.on('leave', () => detachPlayer(player));
@@ -1014,7 +1054,7 @@ function tryFire(p) {
   p.lastFire = t;
   const dir = forwardFromYP(p.yaw, p.pitch);
   const start = vadd(p.pos, vscale(dir, 5));
-  state.rockets.push({ id: state.rocketSeq++, owner: p.id, p: start, d: dir, born: t, target: null, targetKind: null });
+  state.rockets.push({ id: state.rocketSeq++, owner: p.id, p: start, d: dir, born: t, target: null, targetKind: null, awarded: {} });
   io.emit('shot', { id: p.id, p: [r2(start.x), r2(start.y), r2(start.z)] });
   return true;
 }
@@ -1035,7 +1075,17 @@ function giveCrown(toId, how, fromId) {
     p.burstUntil = t + CROWN_BURST_TIME;
     p.invulnUntil = t + CROWN_BURST_TIME;
   }
+  if (how !== 'pickup') maybeBotEmote(p, t, BOT_CROWN_EMOTES);   // bots gloat on a steal
   io.emit('crown', { holderId: toId, by: toId, from: fromId || null, how });
+}
+
+/** Bots occasionally emote on big moments (crown steal, being hit): 10% chance, rate-limited. */
+function maybeBotEmote(p, t, pool) {
+  if (!p || !p.isBot || p.gone) return;
+  if (Math.random() >= 0.1) return;
+  if (t - p.lastEmoteAt < EMOTE_COOLDOWN_S) return;
+  p.lastEmoteAt = t;
+  io.emit('emote', { id: p.id, emoji: pool[Math.floor(Math.random() * pool.length)], p: [r2(p.pos.x), r2(p.pos.y), r2(p.pos.z)] });
 }
 
 function findHomingTarget(r, t) {
@@ -1139,6 +1189,7 @@ function stepRockets(dt, t) {
         p.tumbleUntil = t + TUMBLE_TIME * p.perk.tumble;
         let crownStolen = false;
         if (shooter) shooter.stats.hits++;
+        maybeBotEmote(p, t, BOT_HIT_EMOTES);
         if (state.settings.mode === 'crown' && state.crown.holderId === p.id && shooter) {
           crownStolen = true;
           giveCrown(shooter.id, 'rocket', p.id);
@@ -1147,6 +1198,18 @@ function stepRockets(dt, t) {
         }
         io.emit('hit', { shooter: r.owner, victim: p.id, p: [r2(r.p.x), r2(r.p.y), r2(r.p.z)], crownStolen });
         break;
+      }
+    }
+    // Style: CLOSE CALL — an enemy rocket slipped within 8m without connecting
+    if (!dead) {
+      for (const p of state.players.values()) {
+        if (p.id === r.owner || p.gone || r.awarded[p.id]) continue;
+        if (dist(p.pos, r.p) < STYLE_CLOSE_CALL_R
+          && t - p.lastCloseCallAt >= STYLE_CLOSE_CALL_THROTTLE_S) {
+          r.awarded[p.id] = true;   // once per rocket
+          p.lastCloseCallAt = t;
+          awardStyle(p, 'closeCall', STYLE_CLOSE_CALL_PTS, t);
+        }
       }
     }
     // Decoy collision: any rocket hit destroys the decoy
@@ -1205,6 +1268,7 @@ function stepMines(dt, t) {
             p.tumbleUntil = t + TUMBLE_TIME * p.perk.tumble;
             let crownStolen = false;
             if (miner) miner.stats.hits++;
+            maybeBotEmote(p, t, BOT_HIT_EMOTES);
             if (state.settings.mode === 'crown' && state.crown.holderId === p.id && miner) {
               crownStolen = true;
               giveCrown(miner.id, 'mine', p.id);
@@ -1267,6 +1331,8 @@ function stepRaceGate(p, t) {
   if (!cross.crossed) return;
   if (p.gateCooldown[a.id] > t) return;
   p.gateCooldown[a.id] = t + 3;
+  // Style: GATE WEAVE — barrel roll active while threading the gate
+  if (t < p.rollingUntil) awardStyle(p, 'gateWeave', STYLE_GATE_WEAVE_PTS, t);
   p.race.gatesPassed++;
   const total = state.race.course.length;
   const isFinal = p.race.gateIndex >= total - 1;
@@ -1318,6 +1384,8 @@ function stepGatesAndPickups(t) {
         if (prev !== undefined && prev !== side && Math.abs(along) < 30 && lateral < a.gateR + 1.5) {
           if (!(p.gateCooldown[a.id] > t)) {
             p.gateCooldown[a.id] = t + 3;
+            // Style: GATE WEAVE — barrel roll active while blasting through the arch
+            if (t < p.rollingUntil) awardStyle(p, 'gateWeave', STYLE_GATE_WEAVE_PTS, t);
             awardPoints(p, 25, t);
             p.superUntil = t + SUPER_TIME * (p.perk && p.perk.superTime ? p.perk.superTime : 1);
             io.emit('gate', { id: a.id, by: p.id, p: [r2(a.x), r2(a.y), r2(a.z)] });
@@ -1466,6 +1534,27 @@ function stepMeteors(dt, t) {
     if (!dead) alive.push(m);
   }
   state.meteors = alive;
+}
+
+// ---------------------------------------------------------------------------
+// Style scoring: LOW RIDER — sustained flight just over the waves (all modes).
+// CLOSE CALL lives in stepRockets, GATE WEAVE in stepRaceGate / stepGatesAndPickups.
+// ---------------------------------------------------------------------------
+function stepStyle(t) {
+  for (const p of state.players.values()) {
+    if (p.gone) continue;
+    if (p.pos.y - WATER_LEVEL < STYLE_LOW_RIDER_ALT && !(t < p.tumbleUntil)) {
+      if (!p.lowSince) {
+        p.lowSince = t;
+      } else if (t - p.lowSince >= STYLE_LOW_RIDER_SUSTAIN_S
+        && t - p.lastLowAward >= STYLE_LOW_RIDER_COOLDOWN_S) {
+        p.lastLowAward = t;
+        awardStyle(p, 'lowRider', STYLE_LOW_RIDER_PTS, t);
+      }
+    } else {
+      p.lowSince = 0;   // climbed away: the sustain clock resets
+    }
+  }
 }
 
 /** Per-tick event scheduler: activation at the seeded time, expiry, per-event stepping. */
@@ -1823,6 +1912,7 @@ function tick() {
     stepGatesAndPickups(t);
     stepBalloons(t);
     stepPickups(t);
+    stepStyle(t);
     const before = state.players.size;
     purgeExpiredGone(t);
     if (state.players.size !== before) broadcastLobby();
