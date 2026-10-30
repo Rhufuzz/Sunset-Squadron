@@ -3,6 +3,21 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.7.0] — 2026-10-30
+
+### Added
+- **Style scoring** (all modes, Frenzy doubles it via `awardPoints()`):
+  **CLOSE CALL** +10 (enemy rocket slips within 8 m without connecting — once per
+  rocket, 2 s per-jet throttle), **LOW RIDER** +15 (≥ 3 s sustained flight under
+  15 m over water, re-awardable every 10 s), **GATE WEAVE** +25 (barrel roll while
+  crossing a race gate or blitz arch). Broadcast as `style {kind, points, id}`;
+  HUD stunt ticker (last 4, fading) + procedural stings (whoosh / surf glide / crowd chant).
+- **Emotes with pilot chatter:** 5-button emoji bar above the touch controls
+  (keys 1–4 on desktop), whitelisted server-side (12 emoji), rate-limited to
+  1 per 5 s per pilot (silent drop). Floating emoji sprite over the jet for 3 s +
+  Animal-Crossing-style procedural gibberish voiced per pilot (pitch base shifts
+  by pilot). Bots emote on crown steals and hits (10 %, rate-limited).
+
 ## [1.6.0] — 2026-10-30
 
 ### Added
