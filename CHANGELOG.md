@@ -3,6 +3,25 @@
 All notable changes to **Sunset Squadron: Crown Chase**.
 Versions follow [semver](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [1.8.0] — 2026-10-30
+
+### Added
+- **Red vs Blue team mode** (fourth mode in the lobby picker): pilots are auto-assigned
+  to balanced teams at round start and spawn clustered on their team's side; name tags,
+  jets and contrails tint red (#ff5e5b) / blue (#6ba8ff).
+- **Team Crown Relay:** two crowns in play, one per team, granted to each team's first
+  pilot (3 s burst + invulnerability). Only the ENEMY team can steal a held crown — via
+  rocket, mine, or slicing the holder's ribbon; a loose crown drifts home and can be
+  recovered (or stolen) by anyone. Crown seconds tick +1/s for whoever holds it.
+  Friendly fire is OFF in team mode (rockets/mines/style credit skip teammates), and
+  hitting an enemy awards +10.
+- **Team scoreboard:** mini-board shows live 🔴/🔵 totals on top; round-end payload
+  carries `teams: {red, blue}` + `winnerTeam`; leaderboard tracks the new `teams` mode
+  (wins by team membership). Bots hunt the enemy crown holder 50 % of the time.
+- Wire additions: roundStart/snapshot `crowns: {red:{h,pos}, blue:{h,pos}}`, player
+  `team`/`tm` fields, `crown` events with `team`, round-end `teamTotals`.
+- 4 new unit tests (30 total).
+
 ## [1.7.0] — 2026-10-30
 
 ### Added
